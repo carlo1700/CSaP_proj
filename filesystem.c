@@ -7,13 +7,16 @@
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <grp.h>
 #include <limits.h>
+#include <pwd.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/file.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 static void set_error(char *error, size_t error_size, const char *message)
@@ -50,14 +53,35 @@ int fs_initialize_root(const char *root_path, char *error, size_t error_size)
     char canonical_root[PATH_MAX];
     char users_path[PATH_MAX];
     struct stat status;
+    int root_created = 0;
 
-    if (mkdir(root_path, 0750) < 0 && errno != EEXIST) {
+    if (mkdir(root_path, 0750) == 0) {
+        root_created = 1;
+    } else if (errno != EEXIST) {
         set_error(error, error_size, "cannot create root directory");
         return -1;
     }
     if (realpath(root_path, canonical_root) == NULL) {
         set_error(error, error_size, "cannot resolve root directory");
         return -1;
+    }
+    if (strcmp(canonical_root, "/") == 0) {
+        errno = EINVAL;
+        set_error(error, error_size, "server root cannot be the filesystem root");
+        return -1;
+    }
+    if (geteuid() == 0) {
+        struct group *shared_group = getgrnam("users");
+        if (root_created && shared_group == NULL) {
+            snprintf(error, error_size, "required shared system group 'users' is missing");
+            return -1;
+        }
+        if (root_created && shared_group != NULL &&
+            (chown(canonical_root, 0, shared_group->gr_gid) < 0 ||
+             chmod(canonical_root, 0711) < 0)) {
+            set_error(error, error_size, "cannot configure root directory");
+            return -1;
+        }
     }
     if (snprintf(users_path, sizeof(users_path), "%s/users", canonical_root) >=
         (int)sizeof(users_path)) {
@@ -75,6 +99,15 @@ int fs_initialize_root(const char *root_path, char *error, size_t error_size)
         set_error(error, error_size, "users path must be a directory");
         return -1;
     }
+    if (geteuid() == 0) {
+        struct group *shared_group = getgrnam("users");
+        if (shared_group != NULL &&
+            (chown(users_path, 0, shared_group->gr_gid) < 0 ||
+             chmod(users_path, 0710) < 0)) {
+            set_error(error, error_size, "cannot configure users directory");
+            return -1;
+        }
+    }
     return 0;
 }
 
@@ -83,15 +116,68 @@ int fs_create_user(const char *root, const char *username, mode_t permissions,
 {
     char user_path[PATH_MAX];
     struct stat status;
+    struct group *shared_group;
+    struct passwd *user;
+    pid_t child;
+    pid_t waited;
+    int child_status;
 
     if (!valid_username(username)) {
         snprintf(error, error_size, "invalid username");
+        return -1;
+    }
+    if (geteuid() != 0) {
+        snprintf(error, error_size,
+                 "create_user requires the server to run with root privileges");
+        return -1;
+    }
+    shared_group = getgrnam("users");
+    if (shared_group == NULL) {
+        snprintf(error, error_size, "required shared system group 'users' is missing");
+        return -1;
+    }
+    if (getpwnam(username) != NULL) {
+        snprintf(error, error_size, "a system user with that username already exists");
         return -1;
     }
     if (snprintf(user_path, sizeof(user_path), "%s/users/%s", root, username) >=
         (int)sizeof(user_path)) {
         errno = ENAMETOOLONG;
         set_error(error, error_size, "user path is too long");
+        return -1;
+    }
+    if (lstat(user_path, &status) == 0) {
+        snprintf(error, error_size, "a home directory with that username already exists");
+        return -1;
+    }
+    if (errno != ENOENT) {
+        set_error(error, error_size, "cannot check user home path");
+        return -1;
+    }
+    child = fork();
+    if (child < 0) {
+        set_error(error, error_size, "cannot start adduser");
+        return -1;
+    }
+    if (child == 0) {
+        execlp("adduser", "adduser", "--disabled-password", "--gecos", "",
+               "--ingroup", "users", username, (char *)NULL);
+        _exit(127);
+    }
+    do {
+        waited = waitpid(child, &child_status, 0);
+    } while (waited < 0 && errno == EINTR);
+    if (waited < 0) {
+        set_error(error, error_size, "cannot wait for adduser");
+        return -1;
+    }
+    if (!WIFEXITED(child_status) || WEXITSTATUS(child_status) != 0) {
+        snprintf(error, error_size, "adduser failed to create system account");
+        return -1;
+    }
+    user = getpwnam(username);
+    if (user == NULL || user->pw_gid != shared_group->gr_gid) {
+        snprintf(error, error_size, "created account is not in the shared users group");
         return -1;
     }
     if (mkdir(user_path, permissions) < 0) {
@@ -111,6 +197,11 @@ int fs_create_user(const char *root, const char *username, mode_t permissions,
         set_error(error, error_size, "user home is not a directory");
         return -1;
     }
+    if (chown(user_path, user->pw_uid, shared_group->gr_gid) < 0 ||
+        chmod(user_path, permissions) < 0) {
+        set_error(error, error_size, "cannot set user home ownership or permissions");
+        return -1;
+    }
     return 0;
 }
 
@@ -119,6 +210,7 @@ int fs_login(fs_session *session, const char *root, const char *username,
 {
     char user_path[PATH_MAX];
     struct stat status;
+    struct passwd *user;
 
     if (!valid_username(username)) {
         snprintf(error, error_size, "invalid username");
@@ -136,6 +228,16 @@ int fs_login(fs_session *session, const char *root, const char *username,
         set_error(error, error_size, "user does not exist");
         return -1;
     }
+    user = getpwnam(username);
+    if (user == NULL) {
+        snprintf(error, error_size, "user has no corresponding system account");
+        return -1;
+    }
+    if (status.st_uid != user->pw_uid) {
+        errno = EACCES;
+        set_error(error, error_size, "user home has the wrong system owner");
+        return -1;
+    }
 
     snprintf(session->root, sizeof(session->root), "%s", root);
     if (realpath(user_path, session->home) == NULL) {
@@ -143,6 +245,8 @@ int fs_login(fs_session *session, const char *root, const char *username,
         return -1;
     }
     snprintf(session->username, sizeof(session->username), "%s", username);
+    session->uid = user->pw_uid;
+    session->gid = user->pw_gid;
     session->cwd[0] = '\0';
     return 0;
 }
@@ -304,15 +408,24 @@ int fs_chmod(const fs_session *session, const char *path, mode_t permissions,
              char *error, size_t error_size)
 {
     char resolved[PATH_MAX];
+    int descriptor;
 
     if (fs_resolve_path(session, path, 0, resolved, sizeof(resolved),
                         error, error_size) < 0) {
         return -1;
     }
-    if (chmod(resolved, permissions) < 0) {
-        set_error(error, error_size, "cannot change permissions");
+    descriptor = open(resolved, O_RDONLY | O_NOFOLLOW);
+    if (descriptor < 0) {
+        set_error(error, error_size, "cannot open path to change permissions");
         return -1;
     }
+    if (flock(descriptor, LOCK_EX) < 0 ||
+        fchmod(descriptor, permissions) < 0) {
+        set_error(error, error_size, "cannot change permissions");
+        close(descriptor);
+        return -1;
+    }
+    close(descriptor);
     return 0;
 }
 
@@ -321,6 +434,7 @@ int fs_move(const fs_session *session, const char *source, const char *destinati
 {
     char source_path[PATH_MAX];
     char destination_path[PATH_MAX];
+    int source_fd;
 
     if (fs_resolve_path(session, source, 0, source_path, sizeof(source_path),
                         error, error_size) < 0 ||
@@ -328,10 +442,22 @@ int fs_move(const fs_session *session, const char *source, const char *destinati
                         sizeof(destination_path), error, error_size) < 0) {
         return -1;
     }
-    if (rename(source_path, destination_path) < 0) {
-        set_error(error, error_size, "cannot move path");
+    source_fd = open(source_path, O_RDONLY | O_NOFOLLOW);
+    if (source_fd < 0) {
+        set_error(error, error_size, "cannot open path to move");
         return -1;
     }
+    if (flock(source_fd, LOCK_EX) < 0) {
+        set_error(error, error_size, "cannot lock path to move");
+        close(source_fd);
+        return -1;
+    }
+    if (rename(source_path, destination_path) < 0) {
+        set_error(error, error_size, "cannot move path");
+        close(source_fd);
+        return -1;
+    }
+    close(source_fd);
     return 0;
 }
 
@@ -451,6 +577,35 @@ int fs_list(const fs_session *session, const char *path, char **output,
     return 0;
 }
 
+int fs_list_other(const fs_session *session, const char *username,
+                  const char *path, char **output, size_t *output_length,
+                  char *error, size_t error_size)
+{
+    fs_session other_session = *session;
+    struct stat status;
+
+    if (!valid_username(username)) {
+        snprintf(error, error_size, "invalid username in list path");
+        return -1;
+    }
+    if (snprintf(other_session.home, sizeof(other_session.home),
+                 "%s/users/%s", session->root, username) >=
+        (int)sizeof(other_session.home)) {
+        errno = ENAMETOOLONG;
+        set_error(error, error_size, "user home path is too long");
+        return -1;
+    }
+    if (lstat(other_session.home, &status) < 0 || !S_ISDIR(status.st_mode) ||
+        S_ISLNK(status.st_mode)) {
+        errno = ENOENT;
+        set_error(error, error_size, "user home does not exist");
+        return -1;
+    }
+    other_session.cwd[0] = '\0';
+    return fs_list(&other_session, path, output, output_length,
+                   error, error_size);
+}
+
 int fs_read(const fs_session *session, const char *path, off_t offset,
             unsigned char **output, size_t *output_length,
             char *error, size_t error_size)
@@ -568,6 +723,8 @@ int fs_delete(const fs_session *session, const char *path,
               char *error, size_t error_size)
 {
     char resolved[PATH_MAX];
+    struct stat status;
+    int descriptor;
 
     if (fs_resolve_path(session, path, 0, resolved, sizeof(resolved),
                         error, error_size) < 0) {
@@ -578,10 +735,28 @@ int fs_delete(const fs_session *session, const char *path,
         set_error(error, error_size, "cannot delete user home");
         return -1;
     }
-    if (unlink(resolved) < 0) {
-        set_error(error, error_size, "cannot delete file");
+    descriptor = open(resolved, O_RDONLY | O_NOFOLLOW);
+    if (descriptor < 0) {
+        set_error(error, error_size, "cannot open file to delete");
         return -1;
     }
+    if (fstat(descriptor, &status) < 0 || !S_ISREG(status.st_mode)) {
+        errno = EISDIR;
+        set_error(error, error_size, "delete supports regular files only");
+        close(descriptor);
+        return -1;
+    }
+    if (flock(descriptor, LOCK_EX) < 0) {
+        set_error(error, error_size, "cannot lock file to delete");
+        close(descriptor);
+        return -1;
+    }
+    if (unlink(resolved) < 0) {
+        set_error(error, error_size, "cannot delete file");
+        close(descriptor);
+        return -1;
+    }
+    close(descriptor);
     return 0;
 }
 
@@ -608,5 +783,97 @@ int fs_change_directory(fs_session *session, const char *path,
         snprintf(session->cwd, sizeof(session->cwd), "%s",
                  resolved + home_length + 1);
     }
+    return 0;
+}
+
+int fs_upload_begin(const fs_session *session, const char *path, int *file_fd,
+                    char *error, size_t error_size)
+{
+    struct stat status;
+    int descriptor;
+    char resolved[PATH_MAX];
+
+    if (fs_resolve_path(session, path, 1, resolved, sizeof(resolved),
+                        error, error_size) < 0) {
+        return -1;
+    }
+    if (strcmp(resolved, session->home) == 0) {
+        errno = EISDIR;
+        set_error(error, error_size, "upload destination must be a file path");
+        return -1;
+    }
+    descriptor = open(resolved, O_WRONLY | O_CREAT | O_NOFOLLOW | O_NONBLOCK,
+                      0600);
+    if (descriptor < 0) {
+        set_error(error, error_size, "cannot open upload destination");
+        return -1;
+    }
+    if (fstat(descriptor, &status) < 0 || !S_ISREG(status.st_mode)) {
+        errno = EINVAL;
+        set_error(error, error_size, "upload destination must be a regular file");
+        close(descriptor);
+        return -1;
+    }
+    if (flock(descriptor, LOCK_EX) < 0 || ftruncate(descriptor, 0) < 0 ||
+        lseek(descriptor, 0, SEEK_SET) < 0) {
+        set_error(error, error_size, "cannot lock or prepare upload destination");
+        close(descriptor);
+        return -1;
+    }
+    *file_fd = descriptor;
+    return 0;
+}
+
+int fs_upload_finish(int file_fd, int commit,
+                     char *error, size_t error_size)
+{
+    int result = 0;
+
+    if (!commit && ftruncate(file_fd, 0) < 0) {
+        set_error(error, error_size, "cannot clear incomplete upload");
+        result = -1;
+    }
+    if (close(file_fd) < 0) {
+        if (result == 0) {
+            set_error(error, error_size, "cannot close uploaded file");
+        }
+        result = -1;
+    }
+    if (!commit && result == 0) {
+        errno = EIO;
+        set_error(error, error_size, "upload did not complete");
+        result = -1;
+    }
+    return result;
+}
+
+int fs_download_open(const fs_session *session, const char *path, int *file_fd,
+                     char *error, size_t error_size)
+{
+    char resolved[PATH_MAX];
+    struct stat status;
+    int descriptor;
+
+    if (fs_resolve_path(session, path, 0, resolved, sizeof(resolved),
+                        error, error_size) < 0) {
+        return -1;
+    }
+    descriptor = open(resolved, O_RDONLY | O_NOFOLLOW);
+    if (descriptor < 0) {
+        set_error(error, error_size, "cannot open file for download");
+        return -1;
+    }
+    if (fstat(descriptor, &status) < 0 || !S_ISREG(status.st_mode)) {
+        errno = EINVAL;
+        set_error(error, error_size, "download source must be a regular file");
+        close(descriptor);
+        return -1;
+    }
+    if (flock(descriptor, LOCK_SH) < 0) {
+        set_error(error, error_size, "cannot lock file for download");
+        close(descriptor);
+        return -1;
+    }
+    *file_fd = descriptor;
     return 0;
 }

@@ -5,12 +5,15 @@
 #include <stddef.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <stdint.h>
 
 typedef struct {
     char root[PATH_MAX];
     char home[PATH_MAX];
     char cwd[PATH_MAX];
     char username[128];
+    uid_t uid;
+    gid_t gid;
 } fs_session;
 
 int fs_initialize_root(const char *root_path, char *error, size_t error_size);
@@ -29,6 +32,9 @@ int fs_move(const fs_session *session, const char *source, const char *destinati
             char *error, size_t error_size);
 int fs_list(const fs_session *session, const char *path, char **output,
             size_t *output_length, char *error, size_t error_size);
+int fs_list_other(const fs_session *session, const char *username,
+                  const char *path, char **output, size_t *output_length,
+                  char *error, size_t error_size);
 int fs_read(const fs_session *session, const char *path, off_t offset,
             unsigned char **output, size_t *output_length,
             char *error, size_t error_size);
@@ -39,5 +45,11 @@ int fs_delete(const fs_session *session, const char *path,
               char *error, size_t error_size);
 int fs_change_directory(fs_session *session, const char *path,
                         char *error, size_t error_size);
+int fs_upload_begin(const fs_session *session, const char *path, int *file_fd,
+                    char *error, size_t error_size);
+int fs_upload_finish(int file_fd, int commit,
+                     char *error, size_t error_size);
+int fs_download_open(const fs_session *session, const char *path, int *file_fd,
+                     char *error, size_t error_size);
 
 #endif

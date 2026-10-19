@@ -1,9 +1,12 @@
+#define _DEFAULT_SOURCE
 #define _POSIX_C_SOURCE 200809L
 
 #include "filesystem.h"
 #include "protocol.h"
 
 #include <errno.h>
+#include <fcntl.h>
+#include <grp.h>
 #include <netdb.h>
 #include <signal.h>
 #include <stdio.h>
@@ -17,6 +20,7 @@
 #define DEFAULT_IP "127.0.0.1"
 #define DEFAULT_PORT "8080"
 #define COMMAND_LIMIT 4096
+#define TRANSFER_CHUNK (64U * 1024U)
 
 static volatile sig_atomic_t stop_server;
 
@@ -85,6 +89,147 @@ static int send_error(int client_fd, const char *message)
     return send_text(client_fd, response);
 }
 
+static int write_all(int file_fd, const unsigned char *data, size_t length)
+{
+    size_t written = 0;
+
+    while (written < length) {
+        ssize_t result = write(file_fd, data + written, length - written);
+        if (result < 0 && errno == EINTR) {
+            continue;
+        }
+        if (result <= 0) {
+            return -1;
+        }
+        written += (size_t)result;
+    }
+    return 0;
+}
+
+static int receive_upload(int client_fd, const fs_session *session,
+                          const char *path)
+{
+    char error[512];
+    int file_fd;
+
+    if (fs_upload_begin(session, path, &file_fd, error, sizeof(error)) < 0) {
+        for (;;) {
+            unsigned char *discarded;
+            size_t discarded_length;
+            if (receive_frame(client_fd, &discarded, &discarded_length) < 0) {
+                return -1;
+            }
+            free(discarded);
+            if (discarded_length == 0) {
+                break;
+            }
+        }
+        return send_error(client_fd, error);
+    }
+
+    for (;;) {
+        unsigned char *chunk;
+        size_t chunk_length;
+
+        if (receive_frame(client_fd, &chunk, &chunk_length) < 0) {
+            fs_upload_finish(file_fd, 0, error, sizeof(error));
+            return -1;
+        }
+        if (chunk_length == 0) {
+            free(chunk);
+            break;
+        }
+        if (write_all(file_fd, chunk, chunk_length) < 0) {
+            free(chunk);
+            fs_upload_finish(file_fd, 0, error, sizeof(error));
+            return -1;
+        }
+        free(chunk);
+    }
+
+    if (fs_upload_finish(file_fd, 1, error, sizeof(error)) < 0) {
+        return send_error(client_fd, error);
+    }
+    return send_text(client_fd, "OK: upload complete\n");
+}
+
+static int send_download(int client_fd, const fs_session *session,
+                         const char *path)
+{
+    unsigned char buffer[TRANSFER_CHUNK];
+    char error[512];
+    int file_fd;
+
+    if (fs_download_open(session, path, &file_fd, error, sizeof(error)) < 0) {
+        return send_error(client_fd, error);
+    }
+    if (send_text(client_fd, "OK: download begins\n") < 0) {
+        close(file_fd);
+        return -1;
+    }
+    for (;;) {
+        ssize_t count = read(file_fd, buffer, sizeof(buffer));
+
+        if (count < 0 && errno == EINTR) {
+            continue;
+        }
+        if (count < 0) {
+            close(file_fd);
+            return -1;
+        }
+        if (count == 0) {
+            break;
+        }
+        if (send_frame(client_fd, buffer, (size_t)count) < 0) {
+            close(file_fd);
+            return -1;
+        }
+    }
+    close(file_fd);
+    return send_frame(client_fd, NULL, 0);
+}
+
+static int send_read(int client_fd, const fs_session *session,
+                     const char *path, off_t offset)
+{
+    unsigned char buffer[TRANSFER_CHUNK];
+    char error[512];
+    int file_fd;
+
+    if (fs_download_open(session, path, &file_fd, error, sizeof(error)) < 0) {
+        return send_error(client_fd, error);
+    }
+    if (lseek(file_fd, offset, SEEK_SET) < 0) {
+        snprintf(error, sizeof(error), "cannot seek file: %s", strerror(errno));
+        close(file_fd);
+        return send_error(client_fd, error);
+    }
+    if (send_text(client_fd, "OK: read begins\n") < 0) {
+        close(file_fd);
+        return -1;
+    }
+    for (;;) {
+        ssize_t count = read(file_fd, buffer, sizeof(buffer));
+
+        if (count < 0 && errno == EINTR) {
+            continue;
+        }
+        if (count < 0) {
+            close(file_fd);
+            return -1;
+        }
+        if (count == 0) {
+            break;
+        }
+        if (send_frame(client_fd, buffer, (size_t)count) < 0) {
+            close(file_fd);
+            return -1;
+        }
+    }
+    close(file_fd);
+    return send_frame(client_fd, NULL, 0);
+}
+
 static int execute_command(int client_fd, const char *root, fs_session *session,
                            int *logged_in, char *command)
 {
@@ -113,6 +258,15 @@ static int execute_command(int client_fd, const char *root, fs_session *session,
         }
         if (fs_login(session, root, arguments[1], error, sizeof(error)) < 0) {
             return send_error(client_fd, error);
+        }
+        if (geteuid() == 0) {
+            if (initgroups(session->username, session->gid) < 0 ||
+                setgid(session->gid) < 0 || setuid(session->uid) < 0) {
+                return send_error(client_fd, "cannot drop privileges to user account");
+            }
+        } else if (session->uid != geteuid()) {
+            return send_error(client_fd,
+                              "server must run as root to switch to this user account");
         }
         *logged_in = 1;
         return send_text(client_fd, "OK: logged in\n");
@@ -202,12 +356,25 @@ static int execute_command(int client_fd, const char *root, fs_session *session,
     if (strcmp(arguments[0], "list") == 0) {
         char *listing;
         size_t listing_length;
+        int result;
 
         if (argument_count > 2) {
-            return send_error(client_fd, "usage: list [path]");
+            return send_error(client_fd, "usage: list [path | @username[/path]]");
         }
-        if (fs_list(session, argument_count == 2 ? arguments[1] : ".",
-                    &listing, &listing_length, error, sizeof(error)) < 0) {
+        if (argument_count == 2 && arguments[1][0] == '@') {
+            char *other_path = strchr(arguments[1] + 1, '/');
+            if (other_path != NULL) {
+                *other_path++ = '\0';
+            }
+            result = fs_list_other(session, arguments[1] + 1,
+                                   other_path == NULL ? "." : other_path,
+                                   &listing, &listing_length,
+                                   error, sizeof(error));
+        } else {
+            result = fs_list(session, argument_count == 2 ? arguments[1] : ".",
+                             &listing, &listing_length, error, sizeof(error));
+        }
+        if (result < 0) {
             return send_error(client_fd, error);
         }
         if (send_frame(client_fd, listing, listing_length) < 0) {
@@ -218,11 +385,23 @@ static int execute_command(int client_fd, const char *root, fs_session *session,
         return 0;
     }
 
+    if (strcmp(arguments[0], "upload") == 0) {
+        if (argument_count != 2) {
+            return send_error(client_fd, "usage: upload <server path>");
+        }
+        return receive_upload(client_fd, session, arguments[1]);
+    }
+
+    if (strcmp(arguments[0], "download") == 0) {
+        if (argument_count != 2) {
+            return send_error(client_fd, "usage: download <server path>");
+        }
+        return send_download(client_fd, session, arguments[1]);
+    }
+
     if (strcmp(arguments[0], "read") == 0) {
         off_t offset = 0;
         const char *path;
-        unsigned char *contents;
-        size_t contents_length;
 
         if (argument_count == 3 &&
             parse_offset(arguments[1], &offset) == 0) {
@@ -233,16 +412,7 @@ static int execute_command(int client_fd, const char *root, fs_session *session,
             return send_error(client_fd,
                               "usage: read [-offset=<num>] <path>");
         }
-        if (fs_read(session, path, offset, &contents, &contents_length,
-                    error, sizeof(error)) < 0) {
-            return send_error(client_fd, error);
-        }
-        if (send_frame(client_fd, contents, contents_length) < 0) {
-            free(contents);
-            return -1;
-        }
-        free(contents);
-        return 0;
+        return send_read(client_fd, session, path, offset);
     }
 
     if (strcmp(arguments[0], "write") == 0) {
@@ -416,6 +586,9 @@ int main(int argc, char **argv)
         }
         if (child == 0) {
             close(listener);
+            action.sa_handler = SIG_DFL;
+            action.sa_flags = 0;
+            sigaction(SIGCHLD, &action, NULL);
             serve_client(client_fd, root);
             close(client_fd);
             _exit(EXIT_SUCCESS);

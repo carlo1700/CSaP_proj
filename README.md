@@ -17,23 +17,28 @@ configured root directory.
   address is `127.0.0.1:8080`; the root and its `users` directory are created
   when missing. Stop it with Ctrl+C in the server terminal.
 - Start a client with `./Client [IP] [port]`.
-- Create a virtual user with `create_user <username> <permissions>` and log in
-  with `login <username>`.
+- Create a user with `create_user <username> <permissions>` and log in with
+  `login <username>`. User creation requires starting the server as root;
+  system accounts are created without passwords and share the `users` group.
 - Use `create`, `chmod`, `move`, `cd`, `list`, `read`, `write`, and `delete`
   after logging in. File and directory permissions use octal notation. Read
-  and write accept `-offset=<num>`; interactive `write` reads lines until a
-  single `.` is entered.
+  and write accept `-offset=<num>`; `read` streams large files, and interactive
+  `write` reads lines until a single `.` is entered.
 - Multiple clients are handled in separate server processes. File reads and
   writes use shared and exclusive file locks, respectively.
+- Transfer files with `upload <client path> <server path>` and
+  `download <server path> <client path>`. Add `-b` to either command to run it
+  in the background; `exit` is refused while background jobs are active.
+- `list @username[/path]` lists another user's home when its group permissions
+  allow access.
 - File paths are confined to the logged-in user's home. Absolute paths are
   interpreted from that home; symbolic links are not followed.
 
 ## Remaining work
 
-Uploads, downloads, background transfers, listing other users' homes, real
-system-user/group ownership, and the optional accepted transfer-request
-feature are not implemented yet. Concurrency and path handling also need
-broader testing before the project is complete.
+The optional accepted transfer-request feature is not implemented yet.
+Concurrency and path handling also need broader testing before the project
+is complete.
 
 ## Constraints
 
