@@ -25,7 +25,11 @@ static int transfer_all(int socket_fd, void *buffer, size_t length, int sending)
         if (result < 0 && errno == EINTR) {
             continue;
         }
-        if (result <= 0) {
+        if (result == 0) {
+            errno = ECONNRESET;
+            return -1;
+        }
+        if (result < 0) {
             return -1;
         }
         transferred += (size_t)result;

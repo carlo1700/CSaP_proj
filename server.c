@@ -26,6 +26,10 @@
 #define DEFAULT_IP "127.0.0.1"
 #define DEFAULT_PORT "8080"
 #define COMMAND_LIMIT 4096
+/* Returned by transfer helpers when the requesting client has disconnected. */
+#define CLIENT_GONE (-2)
+/* A transfer peer silent for this long is considered gone. */
+#define TRANSFER_STALL_SECONDS 30
 
 static volatile sig_atomic_t stop_server;
 static unsigned long long next_transfer_id;
@@ -241,293 +245,245 @@ static mqd_t open_user_notification_queue(uid_t uid)
     return queue;
 }
 
-static int send_transfer_request(int client_fd, const fs_session *session,
-                                 const char *path, const char *recipient)
+static int client_disconnected(int client_fd)
 {
-    struct passwd *recipient_user;
-    transfer_request_message request = {0};
-    struct mq_attr attributes = {0};
-    char reply_name[64];
-    char data_name[64];
-    char source_name[NAME_MAX + 1];
-    char error[512];
-    unsigned char buffer[TRANSFER_CHUNK];
-    unsigned long long identifier;
-    int source_fd;
-    mqd_t recipient_queue = (mqd_t)-1;
-    mqd_t reply_queue = (mqd_t)-1;
-    mqd_t data_queue = (mqd_t)-1;
+    char byte;
+    return recv(client_fd, &byte, 1, MSG_PEEK | MSG_DONTWAIT) == 0;
+}
 
-    recipient_user = getpwnam(recipient);
-    if (recipient_user == NULL || recipient_user->pw_uid == session->uid) {
-        return send_error(client_fd, "recipient must be a different existing user");
-    }
-    if (fs_transfer_source(session, path, &source_fd, source_name,
-                           sizeof(source_name), error, sizeof(error)) < 0) {
-        return send_error(client_fd, error);
-    }
+static int create_transfer_queues(transfer_request_message *request,
+                                  mqd_t *reply_queue, mqd_t *data_queue)
+{
+    struct mq_attr attributes = {0};
+    mode_t old_mask = umask(0007);
+    unsigned long long identifier;
 
     attributes.mq_maxmsg = 10;
     attributes.mq_msgsize = (long)sizeof(transfer_reply_message);
+    do {
+        identifier = ((unsigned long long)getpid() << 32) ^
+                     (unsigned long long)time(NULL) ^ ++next_transfer_id;
+        snprintf(request->reply_queue, sizeof(request->reply_queue),
+                 "%s%ld_%llu", TRANSFER_REPLY_PREFIX, (long)getpid(), identifier);
+        *reply_queue = mq_open(request->reply_queue, O_CREAT | O_EXCL | O_RDWR,
+                               0620, &attributes);
+    } while (*reply_queue == (mqd_t)-1 && errno == EEXIST);
+    if (*reply_queue != (mqd_t)-1) {
+        snprintf(request->data_queue, sizeof(request->data_queue),
+                 "%s%ld_%llu", TRANSFER_DATA_PREFIX, (long)getpid(), identifier);
+        *data_queue = mq_open(request->data_queue, O_CREAT | O_EXCL | O_WRONLY,
+                              0640, &attributes);
+    }
+    umask(old_mask);
+    return *reply_queue == (mqd_t)-1 || *data_queue == (mqd_t)-1 ? -1 : 0;
+}
+
+static void remove_transfer_queues(const transfer_request_message *request,
+                                   mqd_t reply_queue, mqd_t data_queue)
+{
+    if (reply_queue != (mqd_t)-1) {
+        mq_close(reply_queue);
+        mq_unlink(request->reply_queue);
+    }
+    if (data_queue != (mqd_t)-1) {
+        mq_close(data_queue);
+        mq_unlink(request->data_queue);
+    }
+}
+
+/* Queues the request; while the recipient has no queue yet, keep waiting. */
+static int deliver_request(const transfer_request_message *request,
+                           uid_t recipient_uid, int client_fd)
+{
+    char name[64];
+
+    if (make_queue_name(name, sizeof(name), TRANSFER_QUEUE_PREFIX,
+                        (unsigned long long)recipient_uid) < 0) {
+        return -1;
+    }
     for (;;) {
-        identifier =
-            ((unsigned long long)getpid() << 32) ^
-            (unsigned long long)time(NULL) ^ ++next_transfer_id;
-        int written;
-        mode_t old_mask;
+        struct timespec pause = {0, 250000000};
+        mqd_t queue = mq_open(name, O_WRONLY | O_NONBLOCK);
 
-        written = snprintf(reply_name, sizeof(reply_name),
-                           "%s%ld_%llu", TRANSFER_REPLY_PREFIX,
-                           (long)getpid(), identifier);
-        if (written < 0 || (size_t)written >= sizeof(reply_name)) {
-            errno = ENAMETOOLONG;
-            break;
+        if (queue != (mqd_t)-1) {
+            int sent = mq_send(queue, (const char *)request, sizeof(*request), 0);
+            int saved_errno = errno;
+
+            mq_close(queue);
+            if (sent == 0) {
+                return 0;
+            }
+            if (saved_errno != EAGAIN && saved_errno != EINTR) {
+                errno = saved_errno;
+                return -1;
+            }
+        } else if (errno != ENOENT) {
+            return -1;
         }
-        old_mask = umask(0007);
-        reply_queue = mq_open(reply_name, O_CREAT | O_EXCL | O_RDWR,
-                              0620, &attributes);
-        umask(old_mask);
-        if (reply_queue != (mqd_t)-1 || errno != EEXIST) {
-            break;
+        nanosleep(&pause, NULL);
+        if (client_disconnected(client_fd)) {
+            return CLIENT_GONE;
         }
     }
-    if (reply_queue == (mqd_t)-1) {
-        snprintf(error, sizeof(error), "cannot create transfer reply queue: %s",
-                 strerror(errno));
-        close(source_fd);
+}
+
+static int wait_reply(mqd_t queue, int client_fd, transfer_reply_message *reply)
+{
+    for (;;) {
+        struct timespec deadline;
+        ssize_t received;
+
+        clock_gettime(CLOCK_REALTIME, &deadline);
+        ++deadline.tv_sec;
+        received = mq_timedreceive(queue, (char *)reply, sizeof(*reply),
+                                   NULL, &deadline);
+        if (received == (ssize_t)sizeof(*reply)) {
+            return 0;
+        }
+        if (received >= 0) {
+            errno = EBADMSG;
+            return -1;
+        }
+        if (errno != EINTR && errno != ETIMEDOUT) {
+            return -1;
+        }
+        if (client_disconnected(client_fd)) {
+            return CLIENT_GONE;
+        }
+    }
+}
+
+static int send_chunk(mqd_t data_queue, const transfer_reply_message *chunk,
+                      int client_fd)
+{
+    int stalled_seconds = 0;
+
+    for (;;) {
+        struct timespec deadline;
+
+        clock_gettime(CLOCK_REALTIME, &deadline);
+        ++deadline.tv_sec;
+        if (mq_timedsend(data_queue, (const char *)chunk, sizeof(*chunk), 0,
+                         &deadline) == 0) {
+            return 0;
+        }
+        if ((errno != ETIMEDOUT && errno != EINTR) ||
+            ++stalled_seconds >= TRANSFER_STALL_SECONDS) {
+            return -1;
+        }
+        if (client_disconnected(client_fd)) {
+            return CLIENT_GONE;
+        }
+    }
+}
+
+static int stream_source(int source_fd, mqd_t data_queue, int client_fd,
+                         char *error, size_t error_size)
+{
+    for (;;) {
+        transfer_reply_message chunk = {0};
+        ssize_t count;
+        int status;
+
+        do {
+            count = read(source_fd, chunk.payload.chunk.data, TRANSFER_CHUNK);
+        } while (count < 0 && errno == EINTR);
+        if (count < 0) {
+            snprintf(error, error_size, "cannot read source file");
+            chunk.type = TRANSFER_ERROR;
+            snprintf(chunk.payload.error, sizeof(chunk.payload.error), "%s", error);
+            send_chunk(data_queue, &chunk, client_fd);
+            return -1;
+        }
+        chunk.type = count == 0 ? TRANSFER_END : TRANSFER_DATA;
+        chunk.payload.chunk.length = (uint32_t)count;
+        status = send_chunk(data_queue, &chunk, client_fd);
+        if (status == -1) {
+            snprintf(error, error_size, "recipient stopped receiving the file");
+        }
+        if (status != 0 || count == 0) {
+            return status;
+        }
+    }
+}
+
+static int send_transfer_request(int client_fd, const fs_session *session,
+                                 const char *path, const char *recipient)
+{
+    struct passwd *recipient_user = getpwnam(recipient);
+    transfer_request_message request = {0};
+    transfer_reply_message reply = {0};
+    struct timespec now;
+    char error[512] = "";
+    mqd_t reply_queue = (mqd_t)-1;
+    mqd_t data_queue = (mqd_t)-1;
+    uid_t recipient_uid;
+    int source_fd;
+    int status;
+
+    if (recipient_user == NULL || recipient_user->pw_uid == session->uid) {
+        return send_error(client_fd, "recipient must be a different existing user");
+    }
+    recipient_uid = recipient_user->pw_uid;
+    if (fs_transfer_source(session, path, &source_fd, request.filename,
+                           sizeof(request.filename), error, sizeof(error)) < 0) {
         return send_error(client_fd, error);
     }
-    if (snprintf(data_name, sizeof(data_name), "%s%ld_%llu",
-                 TRANSFER_DATA_PREFIX, (long)getpid(), identifier) >=
-        (int)sizeof(data_name)) {
-        mq_close(reply_queue);
-        mq_unlink(reply_name);
-        close(source_fd);
-        return send_error(client_fd, "cannot create transfer data queue name");
-    }
-    {
-        mode_t old_mask = umask(0007);
-        data_queue = mq_open(data_name, O_CREAT | O_EXCL | O_WRONLY,
-                             0640, &attributes);
-        umask(old_mask);
-    }
-    if (data_queue == (mqd_t)-1) {
-        snprintf(error, sizeof(error), "cannot create transfer data queue: %s",
-                 strerror(errno));
-        mq_close(reply_queue);
-        mq_unlink(reply_name);
-        close(source_fd);
-        return send_error(client_fd, error);
-    }
 
-    request.type = TRANSFER_REQUEST;
-    request.sender_pid = getpid();
-    request.sender_uid = session->uid;
-    snprintf(request.sender, sizeof(request.sender), "%s", session->username);
-    snprintf(request.filename, sizeof(request.filename), "%s", source_name);
-    snprintf(request.reply_queue, sizeof(request.reply_queue), "%s", reply_name);
-    snprintf(request.data_queue, sizeof(request.data_queue), "%s", data_name);
-    {
-        struct timespec now;
+    status = create_transfer_queues(&request, &reply_queue, &data_queue);
+    if (status == 0) {
+        request.type = TRANSFER_REQUEST;
+        request.sender_pid = getpid();
+        request.sender_uid = session->uid;
+        snprintf(request.sender, sizeof(request.sender), "%s", session->username);
         clock_gettime(CLOCK_REALTIME, &now);
         snprintf(request.request_id, sizeof(request.request_id), "%ld-%lld-%llu",
                  (long)getpid(), (long long)now.tv_sec,
                  (unsigned long long)now.tv_nsec ^ next_transfer_id);
+        status = deliver_request(&request, recipient_uid, client_fd);
     }
-
-    for (;;) {
-        struct timespec pause = {0, 250000000};
-        char recipient_queue_name[64];
-
-        if (make_queue_name(recipient_queue_name, sizeof(recipient_queue_name),
-                            TRANSFER_QUEUE_PREFIX,
-                            (unsigned long long)recipient_user->pw_uid) < 0) {
-            break;
-        }
-        recipient_queue = mq_open(recipient_queue_name,
-                                  O_WRONLY | O_NONBLOCK);
-        if (recipient_queue != (mqd_t)-1) {
-            if (mq_send(recipient_queue, (const char *)&request,
-                        sizeof(request), 0) == 0) {
-                break;
-            }
-            if (errno != EAGAIN && errno != EINTR) {
-                snprintf(error, sizeof(error), "cannot notify recipient: %s",
-                         strerror(errno));
-                mq_close(recipient_queue);
-                mq_close(reply_queue);
-                mq_close(data_queue);
-                mq_unlink(reply_name);
-                mq_unlink(data_name);
-                close(source_fd);
-                return send_error(client_fd, error);
-            }
-            mq_close(recipient_queue);
-            recipient_queue = (mqd_t)-1;
-        } else if (errno != ENOENT) {
-            snprintf(error, sizeof(error), "cannot contact recipient: %s",
-                     strerror(errno));
-            mq_close(reply_queue);
-            mq_close(data_queue);
-            mq_unlink(reply_name);
-            mq_unlink(data_name);
-            close(source_fd);
-            return send_error(client_fd, error);
-        }
-
-        nanosleep(&pause, NULL);
-        {
-            char byte;
-            ssize_t peek = recv(client_fd, &byte, 1, MSG_PEEK | MSG_DONTWAIT);
-            if (peek == 0) {
-                mq_close(reply_queue);
-                mq_close(data_queue);
-                mq_unlink(reply_name);
-                mq_unlink(data_name);
-                close(source_fd);
-                return -1;
-            }
-        }
+    if (status == 0) {
+        status = wait_reply(reply_queue, client_fd, &reply);
     }
-    mq_close(recipient_queue);
-
-    for (;;) {
-        transfer_reply_message reply;
-        struct timespec deadline;
-        ssize_t received;
-        char byte;
-
-        clock_gettime(CLOCK_REALTIME, &deadline);
-        ++deadline.tv_sec;
-        received = mq_timedreceive(reply_queue, (char *)&reply,
-                                   sizeof(reply), NULL, &deadline);
-        if (received < 0 && (errno == EINTR || errno == ETIMEDOUT)) {
-            ssize_t peek = recv(client_fd, &byte, 1, MSG_PEEK | MSG_DONTWAIT);
-            if (peek == 0) {
-                mq_close(reply_queue);
-                mq_close(data_queue);
-                mq_unlink(reply_name);
-                mq_unlink(data_name);
-                close(source_fd);
-                return -1;
-            }
-            continue;
-        }
-        if (received < 0) {
-            snprintf(error, sizeof(error), "transfer request failed: %s",
-                     strerror(errno));
-            mq_close(reply_queue);
-            mq_close(data_queue);
-            mq_unlink(reply_name);
-            mq_unlink(data_name);
-            close(source_fd);
-            return send_error(client_fd, error);
-        }
-        if ((size_t)received != sizeof(reply)) {
-            mq_close(reply_queue);
-            mq_close(data_queue);
-            mq_unlink(reply_name);
-            mq_unlink(data_name);
-            close(source_fd);
-            return send_error(client_fd, "invalid transfer decision message");
-        }
+    if (status == 0 && reply.type != TRANSFER_ACCEPT) {
         if (reply.type == TRANSFER_REJECT) {
-            mq_close(reply_queue);
-            mq_close(data_queue);
-            mq_unlink(reply_name);
-            mq_unlink(data_name);
-            close(source_fd);
-            return send_error(client_fd, "recipient rejected the transfer request");
-        }
-        if (reply.type == TRANSFER_ERROR) {
+            snprintf(error, sizeof(error), "recipient rejected the transfer request");
+        } else if (reply.type == TRANSFER_ERROR) {
             snprintf(error, sizeof(error), "recipient error: %.255s",
                      reply.payload.error);
-            mq_close(reply_queue);
-            mq_close(data_queue);
-            mq_unlink(reply_name);
-            mq_unlink(data_name);
-            close(source_fd);
-            return send_error(client_fd, error);
+        } else {
+            snprintf(error, sizeof(error), "invalid transfer decision");
         }
-        if (reply.type == TRANSFER_ACCEPT) {
-            break;
-        }
+        status = -1;
+    }
+    if (status == 0) {
+        status = stream_source(source_fd, data_queue, client_fd,
+                               error, sizeof(error));
+    }
+    if (status == 0) {
+        status = wait_reply(reply_queue, client_fd, &reply);
+    }
+    if (status == 0 &&
+        (reply.type != TRANSFER_RESULT || reply.payload.error[0] != '\0')) {
+        snprintf(error, sizeof(error), "%.255s",
+                 reply.type == TRANSFER_RESULT ? reply.payload.error
+                                               : "invalid transfer result");
+        status = -1;
+    }
+    if (status == -1 && error[0] == '\0') {
+        snprintf(error, sizeof(error), "transfer request failed: %s",
+                 strerror(errno));
     }
 
-    for (;;) {
-        ssize_t count;
-        transfer_reply_message reply = {0};
-
-        do {
-            count = read(source_fd, buffer, sizeof(buffer));
-        } while (count < 0 && errno == EINTR);
-        if (count < 0) {
-            reply.type = TRANSFER_ERROR;
-            snprintf(reply.payload.error, sizeof(reply.payload.error),
-                     "cannot read source file");
-            mq_send(reply_queue, (const char *)&reply, sizeof(reply), 0);
-            mq_close(reply_queue);
-            mq_close(data_queue);
-            mq_unlink(reply_name);
-            mq_unlink(data_name);
-            close(source_fd);
-            return send_error(client_fd, reply.payload.error);
-        }
-        reply.type = count == 0 ? TRANSFER_END : TRANSFER_DATA;
-        reply.payload.chunk.length = (uint32_t)count;
-        if (count > 0) {
-            memcpy(reply.payload.chunk.data, buffer, (size_t)count);
-        }
-        if (mq_send(data_queue, (const char *)&reply, sizeof(reply), 0) < 0) {
-            mq_close(reply_queue);
-            mq_close(data_queue);
-            mq_unlink(reply_name);
-            mq_unlink(data_name);
-            close(source_fd);
-            return send_error(client_fd, "recipient disconnected during transfer");
-        }
-        if (count == 0) {
-            break;
-        }
-    }
     close(source_fd);
-    mq_close(data_queue);
-    mq_unlink(data_name);
-
-    for (;;) {
-        transfer_reply_message reply;
-        struct timespec deadline;
-        ssize_t received;
-
-        clock_gettime(CLOCK_REALTIME, &deadline);
-        ++deadline.tv_sec;
-        received = mq_timedreceive(reply_queue, (char *)&reply,
-                                   sizeof(reply), NULL, &deadline);
-        if (received < 0 && (errno == EINTR || errno == ETIMEDOUT)) {
-            char byte;
-            if (recv(client_fd, &byte, 1, MSG_PEEK | MSG_DONTWAIT) == 0) {
-                mq_close(reply_queue);
-                mq_unlink(reply_name);
-                return -1;
-            }
-            continue;
-        }
-        mq_close(reply_queue);
-        mq_unlink(reply_name);
-        if (received < 0) {
-            return send_error(client_fd, "cannot receive transfer result");
-        }
-        if ((size_t)received != sizeof(reply)) {
-            return send_error(client_fd, "invalid transfer result message");
-        }
-        if (reply.type != TRANSFER_RESULT) {
-            return send_error(client_fd, "invalid transfer result");
-        }
-        if (reply.payload.error[0] != '\0') {
-            return send_error(client_fd, reply.payload.error);
-        }
-        return send_text(client_fd, "OK: transfer request accepted; file copied\n");
+    remove_transfer_queues(&request, reply_queue, data_queue);
+    if (status == CLIENT_GONE) {
+        return -1;
     }
+    if (status < 0) {
+        return send_error(client_fd, error);
+    }
+    return send_text(client_fd, "OK: transfer request accepted; file copied\n");
 }
 
 static int write_all(int file_fd, const unsigned char *data, size_t length)
@@ -744,6 +700,7 @@ static int finish_accepted_transfer(int client_fd, const fs_session *session,
     mqd_t data_queue;
     int target_fd;
     int failed = 0;
+    int idle_seconds = 0;
 
     if (!valid_pending_request(&entry->request)) {
         return send_error(client_fd, "sender is no longer online");
@@ -785,13 +742,15 @@ static int finish_accepted_transfer(int client_fd, const fs_session *session,
         received = mq_timedreceive(data_queue, (char *)&reply,
                                    sizeof(reply), NULL, &deadline);
         if (received < 0 && (errno == EINTR || errno == ETIMEDOUT)) {
-            if (kill(entry->request.sender_pid, 0) < 0 && errno == ESRCH) {
+            if ((kill(entry->request.sender_pid, 0) < 0 && errno == ESRCH) ||
+                ++idle_seconds >= TRANSFER_STALL_SECONDS) {
                 failed = 1;
                 snprintf(error, sizeof(error), "transfer sender disconnected");
                 break;
             }
             continue;
         }
+        idle_seconds = 0;
         if (received < 0) {
             failed = 1;
             snprintf(error, sizeof(error), "cannot receive transfer data");
@@ -927,9 +886,12 @@ static int execute_command(int client_fd, const char *root, fs_session *session,
 
     if (strcmp(arguments[0], "login") == 0) {
         fs_session candidate = {0};
+        /* Client-side upload/download connections must not consume notifications. */
+        int notify = argument_count == 2;
         int result;
 
-        if (argument_count != 2) {
+        if (argument_count != 2 &&
+            (argument_count != 3 || strcmp(arguments[2], "--no-notify") != 0)) {
             return send_error(client_fd, "usage: login <username>");
         }
         if (*logged_in) {
@@ -953,9 +915,12 @@ static int execute_command(int client_fd, const char *root, fs_session *session,
             return send_error(client_fd, error);
         }
         *session = candidate;
-        *notification_queue = open_user_notification_queue(session->uid);
-        if (*notification_queue == (mqd_t)-1) {
-            return send_error(client_fd, "cannot open transfer notification queue");
+        if (notify) {
+            *notification_queue = open_user_notification_queue(session->uid);
+            if (*notification_queue == (mqd_t)-1) {
+                return send_error(client_fd,
+                                  "cannot open transfer notification queue");
+            }
         }
         *logged_in = 1;
         return send_text(client_fd, "OK: logged in\n");
@@ -1048,6 +1013,16 @@ static int execute_command(int client_fd, const char *root, fs_session *session,
             return send_error(client_fd, error);
         }
         return send_text(client_fd, "OK: moved\n");
+    }
+
+    if (strcmp(arguments[0], "pwd") == 0) {
+        char response[PATH_MAX + 2];
+
+        if (argument_count != 1) {
+            return send_error(client_fd, "usage: pwd");
+        }
+        snprintf(response, sizeof(response), "/%s\n", session->cwd);
+        return send_text(client_fd, response);
     }
 
     if (strcmp(arguments[0], "cd") == 0) {

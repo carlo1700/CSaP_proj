@@ -58,6 +58,7 @@ Every command prints `OK: ...` or `ERROR: <reason>`.
 | `chmod <path> <perm>` | `OK: permissions changed` |
 | `move <path1> <path2>` | `OK: moved` – if `path2` is a directory the file is moved inside it |
 | `cd <path>` | `OK: directory changed` |
+| `pwd` | current directory, e.g. `/docs` (`/` is the home) |
 | `list [path]` | one line per entry: `rw-r-----	notes.txt	12 bytes` |
 | `read [-offset=<n>] <path>` | file content from byte `n` printed on stdout |
 | `write [-offset=<n>] <path>` | type the content, end with a line containing only `.`; `OK: file written`. Without `-offset` the file is replaced, with it the data is written from byte `n`. New files get permissions 0700 |
@@ -98,6 +99,10 @@ users share the group `users`; "other" bits are never needed).
   them needs access to the other user's home.
 - Background transfers use a forked client process with its own connection;
   the client tracks and reaps them.
+- Every upload/download (also in the foreground) opens its own connection,
+  logs in with `login <user> --no-notify` (so it never consumes transfer
+  notifications) and starts from the client's current directory (`pwd`).
+- A transfer peer that stops responding for 30 seconds is treated as gone.
 
 ## Constraints
 
