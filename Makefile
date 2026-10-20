@@ -1,5 +1,6 @@
 CC = gcc
 CFLAGS = -std=c11 -Wall -Wextra -Wpedantic -Werror -O2
+LDLIBS = -lrt
 
 COMMON_OBJECTS = protocol.o filesystem.o
 
@@ -8,7 +9,7 @@ COMMON_OBJECTS = protocol.o filesystem.o
 all: Server Client
 
 Server: server.o $(COMMON_OBJECTS)
-	$(CC) $(CFLAGS) -o $@ $^
+	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
 
 Client: client.o protocol.o
 	$(CC) $(CFLAGS) -o $@ $^

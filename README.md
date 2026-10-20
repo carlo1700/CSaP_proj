@@ -31,21 +31,26 @@ configured root directory.
   in the background; `exit` is refused while background jobs are active.
 - `list @username[/path]` lists another user's home when its group permissions
   allow access.
+- Request a file from another online user with
+  `transfer_request <file> <dest_user>`. The recipient is notified in real
+  time and can run `accept <directory> <ID>` to receive a copy, or
+  `reject <ID>`. Requests also remain queued while the recipient is offline.
 - File paths are confined to the logged-in user's home. Absolute paths are
   interpreted from that home; symbolic links are not followed.
 
 ## Remaining work
 
-The optional accepted transfer-request feature is not implemented yet.
-Concurrency and path handling also need broader testing before the project
+Concurrency and path handling still need broader testing before the project
 is complete.
 
 ## Constraints
 
 Target Ubuntu 24.04. Use modular C and the system calls and functions covered
 in the course; external libraries are not permitted. Do not use `system()`,
-`popen()`, or command-line utilities to implement file operations. Minimize
-time spent running with elevated privileges.
+`popen()`, or command-line utilities to implement file operations. The server
+must run as root to create system users; after login, each client handler drops
+to that user's privileges. POSIX message queues coordinate transfer requests.
+Minimize time spent running with elevated privileges.
 
 The detailed assignment PDF was provided separately and is not included in
 this public repository.

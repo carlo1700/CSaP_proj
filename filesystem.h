@@ -51,5 +51,13 @@ int fs_upload_finish(int file_fd, int commit,
                      char *error, size_t error_size);
 int fs_download_open(const fs_session *session, const char *path, int *file_fd,
                      char *error, size_t error_size);
+int fs_transfer_source(const fs_session *session, const char *path, int *file_fd,
+                       char *filename, size_t filename_size,
+                       char *error, size_t error_size);
+int fs_transfer_target(const fs_session *session, const char *directory,
+                       const char *filename, int *file_fd, char *target_path,
+                       size_t target_path_size, char *error, size_t error_size);
+int fs_transfer_finish(int file_fd, const char *target_path, int commit,
+                       char *error, size_t error_size);
 
 #endif

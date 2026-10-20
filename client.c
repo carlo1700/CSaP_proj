@@ -6,6 +6,7 @@
 #include <fcntl.h>
 #include <limits.h>
 #include <netdb.h>
+#include <poll.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -24,6 +25,29 @@ typedef struct {
     char second_path[PATH_MAX];
     int background;
 } transfer_command;
+
+static int receive_server_frame(int socket_fd, unsigned char **data,
+                                size_t *length)
+{
+    static const unsigned char notification_prefix[] = "\001NOTIFY ";
+
+    for (;;) {
+        if (receive_frame(socket_fd, data, length) < 0) {
+            return -1;
+        }
+        if (*length >= sizeof(notification_prefix) - 1 &&
+            memcmp(*data, notification_prefix,
+                   sizeof(notification_prefix) - 1) == 0) {
+            fwrite(*data + sizeof(notification_prefix) - 1, 1,
+                   *length - (sizeof(notification_prefix) - 1), stdout);
+            fflush(stdout);
+            free(*data);
+            *data = NULL;
+            continue;
+        }
+        return 0;
+    }
+}
 
 static int connect_to_server(const char *ip, const char *port)
 {
@@ -95,7 +119,7 @@ static int download_file(int socket_fd, const char *server_path,
         perror("cannot send download command");
         return -1;
     }
-    if (receive_frame(socket_fd, &frame, &frame_length) < 0) {
+    if (receive_server_frame(socket_fd, &frame, &frame_length) < 0) {
         perror("cannot receive download data");
         return -1;
     }
@@ -121,7 +145,7 @@ static int download_file(int socket_fd, const char *server_path,
     for (;;) {
         size_t written;
 
-        if (receive_frame(socket_fd, &frame, &frame_length) < 0) {
+        if (receive_server_frame(socket_fd, &frame, &frame_length) < 0) {
             perror("download connection interrupted");
             break;
         }
@@ -167,7 +191,7 @@ static int read_remote_file(int socket_fd, const char *command)
         perror("cannot send read command");
         return -1;
     }
-    if (receive_frame(socket_fd, &frame, &frame_length) < 0) {
+    if (receive_server_frame(socket_fd, &frame, &frame_length) < 0) {
         perror("cannot receive read response");
         return -1;
     }
@@ -484,6 +508,7 @@ static void reap_background_jobs(pid_t *jobs, size_t *job_count)
 static int start_background_transfer(pid_t *jobs, size_t *job_count,
                                      const char *ip, const char *port,
                                      const char *username,
+                                     int control_socket,
                                      const transfer_command *transfer)
 {
     pid_t child;
@@ -498,6 +523,7 @@ static int start_background_transfer(pid_t *jobs, size_t *job_count,
         return -1;
     }
     if (child == 0) {
+        close(control_socket);
         int result = perform_transfer(ip, port, username, transfer->operation,
                                       transfer->first_path,
                                       transfer->second_path);
@@ -545,10 +571,46 @@ int main(int argc, char **argv)
         ssize_t line_length;
         transfer_command transfer = {0};
         int transfer_result;
+        struct pollfd descriptors[2] = {
+            { .fd = STDIN_FILENO, .events = POLLIN | POLLHUP },
+            { .fd = socket_fd, .events = POLLIN | POLLHUP | POLLERR }
+        };
 
         reap_background_jobs(background_jobs, &background_job_count);
         printf("> ");
         fflush(stdout);
+        if (poll(descriptors, 2, -1) < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            perror("poll");
+            break;
+        }
+        if ((descriptors[1].revents & POLLIN) != 0) {
+            if (receive_frame(socket_fd, &response, &response_length) < 0) {
+                perror("server disconnected");
+                break;
+            }
+            if (response_length >= 8 &&
+                memcmp(response, "\001NOTIFY ", 8) == 0) {
+                fwrite(response + 8, 1, response_length - 8, stdout);
+                fflush(stdout);
+                free(response);
+                printf("> ");
+                fflush(stdout);
+                continue;
+            }
+            fprintf(stderr, "unexpected asynchronous server message\n");
+            free(response);
+            break;
+        }
+        if ((descriptors[1].revents & (POLLHUP | POLLERR | POLLNVAL)) != 0) {
+            fprintf(stderr, "server connection closed\n");
+            break;
+        }
+        if ((descriptors[0].revents & (POLLIN | POLLHUP)) == 0) {
+            continue;
+        }
         line_length = getline(&line, &line_capacity, stdin);
         if (line_length < 0) {
             while (background_job_count > 0) {
@@ -578,7 +640,8 @@ int main(int argc, char **argv)
             }
             if (transfer.background) {
                 start_background_transfer(background_jobs, &background_job_count,
-                                          ip, port, logged_in_user, &transfer);
+                                          ip, port, logged_in_user, socket_fd,
+                                          &transfer);
             } else if (perform_transfer(ip, port, logged_in_user,
                                         transfer.operation,
                                         transfer.first_path,
@@ -629,7 +692,8 @@ int main(int argc, char **argv)
                 }
                 free(contents);
             }
-            if (receive_frame(socket_fd, &response, &response_length) < 0) {
+            if (receive_server_frame(socket_fd, &response,
+                                     &response_length) < 0) {
                 perror("server disconnected");
                 break;
             }

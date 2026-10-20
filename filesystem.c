@@ -877,3 +877,118 @@ int fs_download_open(const fs_session *session, const char *path, int *file_fd,
     *file_fd = descriptor;
     return 0;
 }
+
+int fs_transfer_source(const fs_session *session, const char *path, int *file_fd,
+                       char *filename, size_t filename_size,
+                       char *error, size_t error_size)
+{
+    char resolved[PATH_MAX];
+    const char *leaf;
+    int descriptor;
+
+    if (fs_resolve_path(session, path, 0, resolved, sizeof(resolved),
+                        error, error_size) < 0) {
+        return -1;
+    }
+    leaf = strrchr(resolved, '/');
+    leaf = leaf == NULL ? resolved : leaf + 1;
+    if (leaf[0] == '\0' || strcmp(leaf, ".") == 0 ||
+        strcmp(leaf, "..") == 0 ||
+        snprintf(filename, filename_size, "%s", leaf) >= (int)filename_size) {
+        errno = EINVAL;
+        set_error(error, error_size, "invalid transfer source filename");
+        return -1;
+    }
+    descriptor = open(resolved, O_RDONLY | O_NOFOLLOW);
+    if (descriptor < 0) {
+        set_error(error, error_size, "cannot open transfer source");
+        return -1;
+    }
+    {
+        struct stat status;
+        if (fstat(descriptor, &status) < 0 || !S_ISREG(status.st_mode)) {
+            errno = EINVAL;
+            set_error(error, error_size, "transfer source must be a regular file");
+            close(descriptor);
+            return -1;
+        }
+    }
+    if (flock(descriptor, LOCK_SH) < 0) {
+        set_error(error, error_size, "cannot lock transfer source");
+        close(descriptor);
+        return -1;
+    }
+    *file_fd = descriptor;
+    return 0;
+}
+
+int fs_transfer_target(const fs_session *session, const char *directory,
+                       const char *filename, int *file_fd, char *target_path,
+                       size_t target_path_size, char *error, size_t error_size)
+{
+    char resolved_directory[PATH_MAX];
+    struct stat status;
+    int descriptor;
+
+    if (filename == NULL || filename[0] == '\0' ||
+        strchr(filename, '/') != NULL ||
+        strcmp(filename, ".") == 0 || strcmp(filename, "..") == 0) {
+        errno = EINVAL;
+        set_error(error, error_size, "invalid transfer filename");
+        return -1;
+    }
+    if (fs_resolve_path(session, directory, 0, resolved_directory,
+                        sizeof(resolved_directory), error, error_size) < 0) {
+        return -1;
+    }
+    if (stat(resolved_directory, &status) < 0 || !S_ISDIR(status.st_mode)) {
+        errno = ENOTDIR;
+        set_error(error, error_size, "transfer destination is not a directory");
+        return -1;
+    }
+    if (snprintf(target_path, target_path_size, "%s/%s",
+                 resolved_directory, filename) >= (int)target_path_size) {
+        errno = ENAMETOOLONG;
+        set_error(error, error_size, "transfer destination path is too long");
+        return -1;
+    }
+    descriptor = open(target_path,
+                      O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_NONBLOCK,
+                      0600);
+    if (descriptor < 0) {
+        set_error(error, error_size, "cannot create transfer destination");
+        return -1;
+    }
+    if (flock(descriptor, LOCK_EX) < 0) {
+        set_error(error, error_size, "cannot lock transfer destination");
+        close(descriptor);
+        unlink(target_path);
+        return -1;
+    }
+    *file_fd = descriptor;
+    return 0;
+}
+
+int fs_transfer_finish(int file_fd, const char *target_path, int commit,
+                       char *error, size_t error_size)
+{
+    int result = 0;
+
+    if (!commit && ftruncate(file_fd, 0) < 0) {
+        set_error(error, error_size, "cannot clear incomplete transfer");
+        result = -1;
+    }
+    if (close(file_fd) < 0) {
+        if (result == 0) {
+            set_error(error, error_size, "cannot close transferred file");
+        }
+        result = -1;
+    }
+    if (!commit || result < 0) {
+        if (unlink(target_path) < 0 && errno != ENOENT && result == 0) {
+            set_error(error, error_size, "cannot remove incomplete transfer");
+            result = -1;
+        }
+    }
+    return result;
+}
