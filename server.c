@@ -2,6 +2,7 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include "filesystem.h"
+#include "privilege.h"
 #include "protocol.h"
 #include "transfer.h"
 
@@ -28,6 +29,9 @@
 
 static volatile sig_atomic_t stop_server;
 static unsigned long long next_transfer_id;
+static pid_t *handlers;
+static size_t handler_count;
+static size_t handler_capacity;
 
 typedef struct pending_transfer {
     transfer_request_message request;
@@ -57,11 +61,101 @@ static void handle_signal(int signal_number)
     stop_server = 1;
 }
 
-static void reap_children(int signal_number)
+/* Only interrupts poll(); children are reaped in the main loop. */
+static void wake_up(int signal_number)
 {
     (void)signal_number;
-    while (waitpid(-1, NULL, WNOHANG) > 0) {
+}
+
+static void track_handler(pid_t pid)
+{
+    if (handler_count == handler_capacity) {
+        size_t capacity = handler_capacity == 0 ? 16 : handler_capacity * 2;
+        pid_t *grown = realloc(handlers, capacity * sizeof(*handlers));
+        if (grown == NULL) {
+            fprintf(stderr, "warning: cannot track client handler %ld\n",
+                    (long)pid);
+            return;
+        }
+        handlers = grown;
+        handler_capacity = capacity;
     }
+    handlers[handler_count++] = pid;
+}
+
+static void reap_handlers(void)
+{
+    pid_t pid;
+
+    while ((pid = waitpid(-1, NULL, WNOHANG)) > 0) {
+        size_t i;
+        for (i = 0; i < handler_count; ++i) {
+            if (handlers[i] == pid) {
+                handlers[i] = handlers[--handler_count];
+                break;
+            }
+        }
+    }
+}
+
+static void stop_handlers(void)
+{
+    size_t i;
+
+    /* Handlers run as other users after login: killing them needs root. */
+    privilege_raise();
+    for (i = 0; i < handler_count; ++i) {
+        kill(handlers[i], SIGTERM);
+    }
+    privilege_lower();
+    for (;;) {
+        pid_t pid = waitpid(-1, NULL, 0);
+        if (pid < 0 && errno == EINTR) {
+            continue;
+        }
+        if (pid < 0) {
+            break;
+        }
+    }
+    free(handlers);
+}
+
+static int console_in_foreground(void)
+{
+    return !isatty(STDIN_FILENO) || tcgetpgrp(STDIN_FILENO) == getpgrp();
+}
+
+/* Returns 1 on "exit", -1 when stdin is closed, 0 otherwise. */
+static int handle_console(void)
+{
+    char buffer[256];
+    char *save_pointer = NULL;
+    char *line;
+    ssize_t count = read(STDIN_FILENO, buffer, sizeof(buffer) - 1);
+
+    if (count < 0) {
+        return errno == EINTR || errno == EIO || errno == EAGAIN ? 0 : -1;
+    }
+    if (count == 0) {
+        return -1;
+    }
+    buffer[count] = '\0';
+    for (line = strtok_r(buffer, "\r\n", &save_pointer); line != NULL;
+         line = strtok_r(NULL, "\r\n", &save_pointer)) {
+        char word[16];
+        char extra;
+        int words = sscanf(line, "%15s %c", word, &extra);
+
+        if (words == 1 && strcmp(word, "exit") == 0) {
+            return 1;
+        }
+        if (words > 0) {
+            printf("Unknown server command '%s'. Type 'exit' to stop the server.\n",
+                   line);
+        }
+    }
+    fflush(stdout);
+    return 0;
 }
 
 static int send_text(int client_fd, const char *text)
@@ -500,44 +594,9 @@ static int receive_upload(int client_fd, const fs_session *session,
     return send_text(client_fd, "OK: upload complete\n");
 }
 
-static int send_download(int client_fd, const fs_session *session,
-                         const char *path)
-{
-    unsigned char buffer[TRANSFER_CHUNK];
-    char error[512];
-    int file_fd;
-
-    if (fs_download_open(session, path, &file_fd, error, sizeof(error)) < 0) {
-        return send_error(client_fd, error);
-    }
-    if (send_text(client_fd, "OK: download begins\n") < 0) {
-        close(file_fd);
-        return -1;
-    }
-    for (;;) {
-        ssize_t count = read(file_fd, buffer, sizeof(buffer));
-
-        if (count < 0 && errno == EINTR) {
-            continue;
-        }
-        if (count < 0) {
-            close(file_fd);
-            return -1;
-        }
-        if (count == 0) {
-            break;
-        }
-        if (send_frame(client_fd, buffer, (size_t)count) < 0) {
-            close(file_fd);
-            return -1;
-        }
-    }
-    close(file_fd);
-    return send_frame(client_fd, NULL, 0);
-}
-
-static int send_read(int client_fd, const fs_session *session,
-                     const char *path, off_t offset)
+/* Streams a file (used by both read and download) under a shared lock. */
+static int send_file(int client_fd, const fs_session *session,
+                     const char *path, off_t offset, const char *banner)
 {
     unsigned char buffer[TRANSFER_CHUNK];
     char error[512];
@@ -551,7 +610,7 @@ static int send_read(int client_fd, const fs_session *session,
         close(file_fd);
         return send_error(client_fd, error);
     }
-    if (send_text(client_fd, "OK: read begins\n") < 0) {
+    if (send_text(client_fd, banner) < 0) {
         close(file_fd);
         return -1;
     }
@@ -581,7 +640,6 @@ static int valid_pending_request(const transfer_request_message *request)
 {
     struct passwd *sender;
     char queue_path[128];
-    char process_path[64];
     struct stat status;
     int written;
     long queue_pid;
@@ -634,12 +692,6 @@ static int valid_pending_request(const transfer_request_message *request)
                        request->data_queue + 1);
     if (written < 0 || (size_t)written >= sizeof(queue_path) ||
         stat(queue_path, &status) < 0 || status.st_uid != request->sender_uid) {
-        return 0;
-    }
-    written = snprintf(process_path, sizeof(process_path), "/proc/%ld",
-                       (long)request->sender_pid);
-    if (written < 0 || (size_t)written >= sizeof(process_path) ||
-        stat(process_path, &status) < 0 || status.st_uid != request->sender_uid) {
         return 0;
     }
     return 1;
@@ -874,21 +926,33 @@ static int execute_command(int client_fd, const char *root, fs_session *session,
     }
 
     if (strcmp(arguments[0], "login") == 0) {
+        fs_session candidate = {0};
+        int result;
+
         if (argument_count != 2) {
             return send_error(client_fd, "usage: login <username>");
         }
-        if (fs_login(session, root, arguments[1], error, sizeof(error)) < 0) {
+        if (*logged_in) {
+            return send_error(client_fd,
+                              "already logged in; start a new client to change user");
+        }
+        if (privilege_raise() < 0) {
+            return send_error(client_fd, "cannot acquire privileges for login");
+        }
+        result = fs_login(&candidate, root, arguments[1], error, sizeof(error));
+        if (result == 0 &&
+            privilege_become_user(candidate.username, candidate.uid,
+                                  candidate.gid) < 0) {
+            snprintf(error, sizeof(error),
+                     "cannot switch to this user's account "
+                     "(the server must run as root)");
+            result = -1;
+        }
+        privilege_lower();
+        if (result < 0) {
             return send_error(client_fd, error);
         }
-        if (geteuid() == 0) {
-            if (initgroups(session->username, session->gid) < 0 ||
-                setgid(session->gid) < 0 || setuid(session->uid) < 0) {
-                return send_error(client_fd, "cannot drop privileges to user account");
-            }
-        } else if (session->uid != geteuid()) {
-            return send_error(client_fd,
-                              "server must run as root to switch to this user account");
-        }
+        *session = candidate;
         *notification_queue = open_user_notification_queue(session->uid);
         if (*notification_queue == (mqd_t)-1) {
             return send_error(client_fd, "cannot open transfer notification queue");
@@ -902,10 +966,15 @@ static int execute_command(int client_fd, const char *root, fs_session *session,
             return send_error(client_fd,
                               "usage: create_user <username> <permissions in octal>");
         }
+        if (privilege_raise() < 0) {
+            return send_error(client_fd, "cannot acquire privileges for create_user");
+        }
         if (fs_create_user(root, arguments[1], permissions,
                            error, sizeof(error)) < 0) {
+            privilege_lower();
             return send_error(client_fd, error);
         }
+        privilege_lower();
         return send_text(client_fd, "OK: user created\n");
     }
     if (strcmp(arguments[0], "exit") == 0) {
@@ -1016,6 +1085,10 @@ static int execute_command(int client_fd, const char *root, fs_session *session,
         if (result < 0) {
             return send_error(client_fd, error);
         }
+        if (listing_length == 0) {
+            free(listing);
+            return send_text(client_fd, "(empty directory)\n");
+        }
         if (send_frame(client_fd, listing, listing_length) < 0) {
             free(listing);
             return -1;
@@ -1035,7 +1108,8 @@ static int execute_command(int client_fd, const char *root, fs_session *session,
         if (argument_count != 2) {
             return send_error(client_fd, "usage: download <server path>");
         }
-        return send_download(client_fd, session, arguments[1]);
+        return send_file(client_fd, session, arguments[1], 0,
+                         "OK: download begins\n");
     }
 
     if (strcmp(arguments[0], "read") == 0) {
@@ -1051,11 +1125,11 @@ static int execute_command(int client_fd, const char *root, fs_session *session,
             return send_error(client_fd,
                               "usage: read [-offset=<num>] <path>");
         }
-        return send_read(client_fd, session, path, offset);
+        return send_file(client_fd, session, path, offset, "OK: read begins\n");
     }
 
     if (strcmp(arguments[0], "write") == 0) {
-        off_t offset = 0;
+        off_t offset = -1;
         const char *path;
         unsigned char *contents;
         size_t contents_length;
@@ -1211,6 +1285,7 @@ int main(int argc, char **argv)
     char error[512];
     struct sigaction action = {0};
     int listener;
+    int watch_console = 1;
 
     if (argc < 2 || argc > 4) {
         fprintf(stderr, "Usage: %s <root_directory> [IP] [port]\n", argv[0]);
@@ -1224,6 +1299,12 @@ int main(int argc, char **argv)
         perror("cannot resolve server root");
         return EXIT_FAILURE;
     }
+    /* Handlers use paths relative to this cwd: after setuid the user may not
+       be allowed to traverse the root's ancestors (e.g. a 0750 /home/x). */
+    if (chdir(root) < 0) {
+        perror("cannot enter server root");
+        return EXIT_FAILURE;
+    }
 
     action.sa_handler = handle_signal;
     sigemptyset(&action.sa_mask);
@@ -1232,32 +1313,67 @@ int main(int argc, char **argv)
         perror("sigaction");
         return EXIT_FAILURE;
     }
-    action.sa_handler = reap_children;
-    action.sa_flags = SA_RESTART | SA_NOCLDSTOP;
+    action.sa_handler = wake_up;
+    action.sa_flags = SA_NOCLDSTOP;
     if (sigaction(SIGCHLD, &action, NULL) < 0) {
         perror("sigaction");
         return EXIT_FAILURE;
     }
+    /* A background server must not be stopped when the shell owns the tty. */
+    signal(SIGTTIN, SIG_IGN);
 
     listener = create_listener(ip, port);
     if (listener < 0) {
         return EXIT_FAILURE;
     }
-    printf("Server listening on %s:%s (root: %s)\n", ip, port, root);
+    if (privilege_init() < 0) {
+        perror("cannot drop root privileges");
+        return EXIT_FAILURE;
+    }
+    printf("Server listening on %s:%s (root: %s). Type 'exit' to stop it.\n",
+           ip, port, root);
     fflush(stdout);
 
     while (!stop_server) {
-        int client_fd = accept(listener, NULL, NULL);
+        struct pollfd descriptors[2] = {
+            { .fd = listener, .events = POLLIN },
+            { .fd = STDIN_FILENO, .events = POLLIN }
+        };
+        nfds_t descriptor_count =
+            watch_console && console_in_foreground() ? 2 : 1;
+        int client_fd;
+        pid_t child;
 
-        if (client_fd < 0) {
+        reap_handlers();
+        /* The timeout bounds how long a zombie can survive a lost SIGCHLD race. */
+        if (poll(descriptors, descriptor_count, 1000) < 0) {
             if (errno == EINTR) {
                 continue;
             }
-            perror("accept");
+            perror("poll");
             break;
         }
+        if (descriptor_count == 2 && descriptors[1].revents != 0) {
+            int console = handle_console();
+            if (console > 0) {
+                break;
+            }
+            if (console < 0) {
+                watch_console = 0;
+            }
+        }
+        if ((descriptors[0].revents & POLLIN) == 0) {
+            continue;
+        }
+        client_fd = accept(listener, NULL, NULL);
+        if (client_fd < 0) {
+            if (errno != EINTR && errno != ECONNABORTED) {
+                perror("accept");
+            }
+            continue;
+        }
 
-        pid_t child = fork();
+        child = fork();
         if (child < 0) {
             perror("fork");
             close(client_fd);
@@ -1268,13 +1384,18 @@ int main(int argc, char **argv)
             action.sa_handler = SIG_DFL;
             action.sa_flags = 0;
             sigaction(SIGCHLD, &action, NULL);
-            serve_client(client_fd, root);
+            sigaction(SIGINT, &action, NULL);
+            sigaction(SIGTERM, &action, NULL);
+            serve_client(client_fd, ".");
             close(client_fd);
             _exit(EXIT_SUCCESS);
         }
+        track_handler(child);
         close(client_fd);
     }
 
+    printf("Server shutting down.\n");
     close(listener);
+    stop_handlers();
     return EXIT_SUCCESS;
 }

@@ -124,7 +124,7 @@ static int download_file(int socket_fd, const char *server_path,
         return -1;
     }
     if (frame_length >= 6 && memcmp(frame, "ERROR:", 6) == 0) {
-        fwrite(frame, 1, frame_length, stderr);
+        fwrite(frame, 1, frame_length, stdout);
         free(frame);
         return -1;
     }
@@ -182,6 +182,7 @@ done:
     return result;
 }
 
+/* Returns 1 if the server refused the read, -1 if the connection is broken. */
 static int read_remote_file(int socket_fd, const char *command)
 {
     unsigned char *frame;
@@ -196,9 +197,9 @@ static int read_remote_file(int socket_fd, const char *command)
         return -1;
     }
     if (frame_length >= 6 && memcmp(frame, "ERROR:", 6) == 0) {
-        fwrite(frame, 1, frame_length, stderr);
+        fwrite(frame, 1, frame_length, stdout);
         free(frame);
-        return -1;
+        return 1;
     }
     if (frame_length != strlen("OK: read begins\n") ||
         memcmp(frame, "OK: read begins\n", frame_length) != 0) {
@@ -215,6 +216,7 @@ static int read_remote_file(int socket_fd, const char *command)
         }
         if (frame_length == 0) {
             free(frame);
+            fflush(stdout);
             return 0;
         }
         if (fwrite(frame, 1, frame_length, stdout) != frame_length) {
@@ -315,7 +317,7 @@ static int perform_transfer(const char *ip, const char *port,
             return -1;
         }
         if (response_length < 2 || memcmp(response, "OK", 2) != 0) {
-            fwrite(response, 1, response_length, stderr);
+            fwrite(response, 1, response_length, stdout);
             free(response);
             close(socket_fd);
             return -1;
@@ -380,7 +382,8 @@ static int collect_write_input(unsigned char **contents, size_t *length)
     return feof(stdin) ? 0 : -1;
 }
 
-static int is_write_command(const char *command)
+/* Recognizes "<name> <path>" and "<name> -offset=<num> <path>". */
+static int is_offset_command(const char *command, const char *name)
 {
     char *copy = strdup(command);
     char *arguments[4] = {0};
@@ -397,42 +400,9 @@ static int is_write_command(const char *command)
          token = strtok_r(NULL, " \t", &save_pointer)) {
         arguments[count++] = token;
     }
-    if (count == 2 && strcmp(arguments[0], "write") == 0) {
+    if (count == 2 && strcmp(arguments[0], name) == 0) {
         valid = 1;
-    } else if (count == 3 && strcmp(arguments[0], "write") == 0 &&
-               strncmp(arguments[1], "-offset=", 8) == 0 &&
-               arguments[1][8] != '\0') {
-        char *end;
-        long long offset;
-
-        errno = 0;
-        offset = strtoll(arguments[1] + 8, &end, 10);
-        valid = errno == 0 && *end == '\0' && offset >= 0;
-    }
-    free(copy);
-    return valid;
-}
-
-static int is_read_command(const char *command)
-{
-    char *copy = strdup(command);
-    char *arguments[4] = {0};
-    char *save_pointer = NULL;
-    char *token;
-    size_t count = 0;
-    int valid = 0;
-
-    if (copy == NULL) {
-        return 0;
-    }
-    for (token = strtok_r(copy, " \t", &save_pointer);
-         token != NULL && count < 4;
-         token = strtok_r(NULL, " \t", &save_pointer)) {
-        arguments[count++] = token;
-    }
-    if (count == 2 && strcmp(arguments[0], "read") == 0) {
-        valid = 1;
-    } else if (count == 3 && strcmp(arguments[0], "read") == 0 &&
+    } else if (count == 3 && strcmp(arguments[0], name) == 0 &&
                strncmp(arguments[1], "-offset=", 8) == 0 &&
                arguments[1][8] != '\0') {
         char *end;
@@ -559,6 +529,8 @@ int main(int argc, char **argv)
         fprintf(stderr, "Usage: %s [IP] [port]\n", argv[0]);
         return EXIT_FAILURE;
     }
+    /* poll() watches the fd: stdio must not hide already-read lines from it. */
+    setvbuf(stdin, NULL, _IONBF, 0);
     socket_fd = connect_to_server(ip, port);
     if (socket_fd < 0) {
         return EXIT_FAILURE;
@@ -596,8 +568,6 @@ int main(int argc, char **argv)
                 fwrite(response + 8, 1, response_length - 8, stdout);
                 fflush(stdout);
                 free(response);
-                printf("> ");
-                fflush(stdout);
                 continue;
             }
             fprintf(stderr, "unexpected asynchronous server message\n");
@@ -645,8 +615,9 @@ int main(int argc, char **argv)
             } else if (perform_transfer(ip, port, logged_in_user,
                                         transfer.operation,
                                         transfer.first_path,
-                                        transfer.second_path) == 0) {
-                printf("OK: %s complete\n", transfer.operation);
+                                        transfer.second_path) == 0 &&
+                       strcmp(transfer.operation, "download") == 0) {
+                printf("OK: download complete\n");
             }
             continue;
         }
@@ -662,10 +633,14 @@ int main(int argc, char **argv)
             }
             break;
         }
-        if (is_read_command(line)) {
+        if (is_offset_command(line, "read")) {
             if (read_remote_file(socket_fd, line) < 0) {
                 break;
             }
+            continue;
+        }
+        if (is_offset_command(line, "write") && logged_in_user[0] == '\0') {
+            printf("ERROR: log in first with: login <username>\n");
             continue;
         }
         {
@@ -677,7 +652,7 @@ int main(int argc, char **argv)
                 perror("cannot send command");
                 break;
             }
-            if (is_write_command(line)) {
+            if (is_offset_command(line, "write")) {
                 unsigned char *contents;
                 size_t contents_length;
 

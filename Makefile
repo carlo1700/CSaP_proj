@@ -2,7 +2,7 @@ CC = gcc
 CFLAGS = -std=c11 -Wall -Wextra -Wpedantic -Werror -O2
 LDLIBS = -lrt
 
-COMMON_OBJECTS = protocol.o filesystem.o
+COMMON_OBJECTS = protocol.o filesystem.o privilege.o
 
 .PHONY: all clean
 

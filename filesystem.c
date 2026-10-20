@@ -26,6 +26,36 @@ static void set_error(char *error, size_t error_size, const char *message)
     }
 }
 
+/*
+ * Opens and locks an existing path. Returns -1 if it cannot be opened: then
+ * nobody without the same rights can be using it, so callers go on unlocked.
+ */
+static int open_locked(const char *path, int operation)
+{
+    int descriptor = open(path, O_RDONLY | O_NOFOLLOW);
+
+    if (descriptor < 0 && errno == EACCES) {
+        descriptor = open(path, O_WRONLY | O_NOFOLLOW | O_NONBLOCK);
+    }
+    if (descriptor < 0) {
+        return -1;
+    }
+    while (flock(descriptor, operation) < 0) {
+        if (errno != EINTR) {
+            close(descriptor);
+            return -1;
+        }
+    }
+    return descriptor;
+}
+
+static void close_locked(int descriptor)
+{
+    if (descriptor >= 0) {
+        close(descriptor);
+    }
+}
+
 static int valid_username(const char *username)
 {
     size_t i;
@@ -103,7 +133,7 @@ int fs_initialize_root(const char *root_path, char *error, size_t error_size)
         struct group *shared_group = getgrnam("users");
         if (shared_group != NULL &&
             (chown(users_path, 0, shared_group->gr_gid) < 0 ||
-             chmod(users_path, 0710) < 0)) {
+             chmod(users_path, 0750) < 0)) {
             set_error(error, error_size, "cannot configure users directory");
             return -1;
         }
@@ -240,10 +270,8 @@ int fs_login(fs_session *session, const char *root, const char *username,
     }
 
     snprintf(session->root, sizeof(session->root), "%s", root);
-    if (realpath(user_path, session->home) == NULL) {
-        set_error(error, error_size, "cannot resolve user home");
-        return -1;
-    }
+    /* user_path has no symlinks or "..": valid_username and lstat checked it. */
+    snprintf(session->home, sizeof(session->home), "%s", user_path);
     snprintf(session->username, sizeof(session->username), "%s", username);
     session->uid = user->pw_uid;
     session->gid = user->pw_gid;
@@ -409,24 +437,19 @@ int fs_chmod(const fs_session *session, const char *path, mode_t permissions,
 {
     char resolved[PATH_MAX];
     int descriptor;
+    int result;
 
     if (fs_resolve_path(session, path, 0, resolved, sizeof(resolved),
                         error, error_size) < 0) {
         return -1;
     }
-    descriptor = open(resolved, O_RDONLY | O_NOFOLLOW);
-    if (descriptor < 0) {
-        set_error(error, error_size, "cannot open path to change permissions");
-        return -1;
-    }
-    if (flock(descriptor, LOCK_EX) < 0 ||
-        fchmod(descriptor, permissions) < 0) {
+    descriptor = open_locked(resolved, LOCK_EX);
+    result = chmod(resolved, permissions);
+    if (result < 0) {
         set_error(error, error_size, "cannot change permissions");
-        close(descriptor);
-        return -1;
     }
-    close(descriptor);
-    return 0;
+    close_locked(descriptor);
+    return result;
 }
 
 int fs_move(const fs_session *session, const char *source, const char *destination,
@@ -434,7 +457,10 @@ int fs_move(const fs_session *session, const char *source, const char *destinati
 {
     char source_path[PATH_MAX];
     char destination_path[PATH_MAX];
+    struct stat status;
     int source_fd;
+    int destination_fd = -1;
+    int result;
 
     if (fs_resolve_path(session, source, 0, source_path, sizeof(source_path),
                         error, error_size) < 0 ||
@@ -442,23 +468,38 @@ int fs_move(const fs_session *session, const char *source, const char *destinati
                         sizeof(destination_path), error, error_size) < 0) {
         return -1;
     }
-    source_fd = open(source_path, O_RDONLY | O_NOFOLLOW);
-    if (source_fd < 0) {
-        set_error(error, error_size, "cannot open path to move");
+    if (strcmp(source_path, session->home) == 0) {
+        errno = EBUSY;
+        set_error(error, error_size, "cannot move user home");
         return -1;
     }
-    if (flock(source_fd, LOCK_EX) < 0) {
-        set_error(error, error_size, "cannot lock path to move");
-        close(source_fd);
-        return -1;
+    /* Like mv: moving onto an existing directory places the source inside it. */
+    if (stat(destination_path, &status) == 0 && S_ISDIR(status.st_mode)) {
+        size_t length = strlen(destination_path);
+        if (snprintf(destination_path + length, sizeof(destination_path) - length,
+                     "/%s", strrchr(source_path, '/') + 1) >=
+            (int)(sizeof(destination_path) - length)) {
+            errno = ENAMETOOLONG;
+            set_error(error, error_size, "destination path is too long");
+            return -1;
+        }
     }
-    if (rename(source_path, destination_path) < 0) {
+    /* Fixed lock order, so that "move a b" and "move b a" cannot deadlock. */
+    if (strcmp(source_path, destination_path) < 0) {
+        source_fd = open_locked(source_path, LOCK_EX);
+        destination_fd = open_locked(destination_path, LOCK_EX);
+    } else {
+        destination_fd = strcmp(source_path, destination_path) != 0
+                             ? open_locked(destination_path, LOCK_EX) : -1;
+        source_fd = open_locked(source_path, LOCK_EX);
+    }
+    result = rename(source_path, destination_path);
+    if (result < 0) {
         set_error(error, error_size, "cannot move path");
-        close(source_fd);
-        return -1;
     }
-    close(source_fd);
-    return 0;
+    close_locked(destination_fd);
+    close_locked(source_fd);
+    return result;
 }
 
 static int append_text(char **buffer, size_t *length, size_t *capacity,
@@ -489,8 +530,9 @@ static int append_text(char **buffer, size_t *length, size_t *capacity,
     return 0;
 }
 
-int fs_list(const fs_session *session, const char *path, char **output,
-            size_t *output_length, char *error, size_t error_size)
+static int list_directory(const fs_session *session, const char *path,
+                          char **output, size_t *output_length,
+                          char *error, size_t error_size)
 {
     char resolved[PATH_MAX];
     char line[PATH_MAX + 128];
@@ -577,6 +619,35 @@ int fs_list(const fs_session *session, const char *path, char **output,
     return 0;
 }
 
+/*
+ * list may leave the home: paths are resolved inside <root>/users, starting
+ * from the user's cwd, while "/" still denotes the user's home.
+ */
+int fs_list(const fs_session *session, const char *path, char **output,
+            size_t *output_length, char *error, size_t error_size)
+{
+    fs_session view = *session;
+    char absolute[PATH_MAX];
+
+    if (snprintf(view.home, sizeof(view.home), "%s/users", session->root) >=
+            (int)sizeof(view.home) ||
+        snprintf(view.cwd, sizeof(view.cwd), "%s%s%s", session->username,
+                 session->cwd[0] != '\0' ? "/" : "", session->cwd) >=
+            (int)sizeof(view.cwd) ||
+        (path[0] == '/' &&
+         snprintf(absolute, sizeof(absolute), "/%s%s", session->username,
+                  path) >= (int)sizeof(absolute))) {
+        errno = ENAMETOOLONG;
+        set_error(error, error_size, "path is too long");
+        return -1;
+    }
+    if (path[0] == '/') {
+        path = absolute;
+    }
+    return list_directory(&view, path, output, output_length,
+                          error, error_size);
+}
+
 int fs_list_other(const fs_session *session, const char *username,
                   const char *path, char **output, size_t *output_length,
                   char *error, size_t error_size)
@@ -602,80 +673,8 @@ int fs_list_other(const fs_session *session, const char *username,
         return -1;
     }
     other_session.cwd[0] = '\0';
-    return fs_list(&other_session, path, output, output_length,
-                   error, error_size);
-}
-
-int fs_read(const fs_session *session, const char *path, off_t offset,
-            unsigned char **output, size_t *output_length,
-            char *error, size_t error_size)
-{
-    char resolved[PATH_MAX];
-    unsigned char *buffer;
-    size_t used = 0;
-    int descriptor;
-
-    if (fs_resolve_path(session, path, 0, resolved, sizeof(resolved),
-                        error, error_size) < 0) {
-        return -1;
-    }
-    descriptor = open(resolved, O_RDONLY | O_NOFOLLOW);
-    if (descriptor < 0) {
-        set_error(error, error_size, "cannot open file");
-        return -1;
-    }
-    if (flock(descriptor, LOCK_SH) < 0 || lseek(descriptor, offset, SEEK_SET) < 0) {
-        set_error(error, error_size, "cannot lock or seek file");
-        close(descriptor);
-        return -1;
-    }
-    buffer = malloc(PROTOCOL_MAX_FRAME);
-    if (buffer == NULL) {
-        close(descriptor);
-        return -1;
-    }
-    while (used < PROTOCOL_MAX_FRAME) {
-        ssize_t count = read(descriptor, buffer + used,
-                             PROTOCOL_MAX_FRAME - used);
-        if (count < 0 && errno == EINTR) {
-            continue;
-        }
-        if (count < 0) {
-            set_error(error, error_size, "cannot read file");
-            free(buffer);
-            close(descriptor);
-            return -1;
-        }
-        if (count == 0) {
-            break;
-        }
-        used += (size_t)count;
-    }
-    if (used == PROTOCOL_MAX_FRAME) {
-        unsigned char extra_byte;
-        ssize_t count;
-
-        do {
-            count = read(descriptor, &extra_byte, 1);
-        } while (count < 0 && errno == EINTR);
-        if (count > 0) {
-            errno = EFBIG;
-            set_error(error, error_size, "file exceeds the transfer size limit");
-            free(buffer);
-            close(descriptor);
-            return -1;
-        }
-        if (count < 0) {
-            set_error(error, error_size, "cannot read file");
-            free(buffer);
-            close(descriptor);
-            return -1;
-        }
-    }
-    close(descriptor);
-    *output = buffer;
-    *output_length = used;
-    return 0;
+    return list_directory(&other_session, path, output, output_length,
+                          error, error_size);
 }
 
 int fs_write(const fs_session *session, const char *path, off_t offset,
@@ -685,7 +684,11 @@ int fs_write(const fs_session *session, const char *path, off_t offset,
     char resolved[PATH_MAX];
     int descriptor;
     size_t written = 0;
+    int replace = offset < 0;
 
+    if (replace) {
+        offset = 0;
+    }
     if (fs_resolve_path(session, path, 1, resolved, sizeof(resolved),
                         error, error_size) < 0) {
         return -1;
@@ -697,7 +700,7 @@ int fs_write(const fs_session *session, const char *path, off_t offset,
         return -1;
     }
     if (flock(descriptor, LOCK_EX) < 0 ||
-        (offset == 0 && ftruncate(descriptor, 0) < 0) ||
+        (replace && ftruncate(descriptor, 0) < 0) ||
         lseek(descriptor, offset, SEEK_SET) < 0) {
         set_error(error, error_size, "cannot lock or seek file for writing");
         close(descriptor);
@@ -725,6 +728,7 @@ int fs_delete(const fs_session *session, const char *path,
     char resolved[PATH_MAX];
     struct stat status;
     int descriptor;
+    int result;
 
     if (fs_resolve_path(session, path, 0, resolved, sizeof(resolved),
                         error, error_size) < 0) {
@@ -735,29 +739,25 @@ int fs_delete(const fs_session *session, const char *path,
         set_error(error, error_size, "cannot delete user home");
         return -1;
     }
-    descriptor = open(resolved, O_RDONLY | O_NOFOLLOW);
-    if (descriptor < 0) {
-        set_error(error, error_size, "cannot open file to delete");
+    if (lstat(resolved, &status) < 0) {
+        set_error(error, error_size, "cannot access path to delete");
         return -1;
     }
-    if (fstat(descriptor, &status) < 0 || !S_ISREG(status.st_mode)) {
-        errno = EISDIR;
-        set_error(error, error_size, "delete supports regular files only");
-        close(descriptor);
-        return -1;
+    if (S_ISDIR(status.st_mode)) {
+        if (rmdir(resolved) < 0) {
+            set_error(error, error_size, "cannot delete directory");
+            return -1;
+        }
+        return 0;
     }
-    if (flock(descriptor, LOCK_EX) < 0) {
-        set_error(error, error_size, "cannot lock file to delete");
-        close(descriptor);
-        return -1;
-    }
-    if (unlink(resolved) < 0) {
+    /* Deleting is a write: wait for readers and writers to finish. */
+    descriptor = open_locked(resolved, LOCK_EX);
+    result = unlink(resolved);
+    if (result < 0) {
         set_error(error, error_size, "cannot delete file");
-        close(descriptor);
-        return -1;
     }
-    close(descriptor);
-    return 0;
+    close_locked(descriptor);
+    return result;
 }
 
 int fs_change_directory(fs_session *session, const char *path,

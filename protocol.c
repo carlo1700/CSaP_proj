@@ -16,7 +16,7 @@ static int transfer_all(int socket_fd, void *buffer, size_t length, int sending)
 
         if (sending) {
             result = send(socket_fd, position + transferred,
-                          length - transferred, 0);
+                          length - transferred, MSG_NOSIGNAL);
         } else {
             result = recv(socket_fd, position + transferred,
                           length - transferred, 0);

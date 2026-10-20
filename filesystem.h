@@ -35,9 +35,7 @@ int fs_list(const fs_session *session, const char *path, char **output,
 int fs_list_other(const fs_session *session, const char *username,
                   const char *path, char **output, size_t *output_length,
                   char *error, size_t error_size);
-int fs_read(const fs_session *session, const char *path, off_t offset,
-            unsigned char **output, size_t *output_length,
-            char *error, size_t error_size);
+/* A negative offset replaces the whole file content. */
 int fs_write(const fs_session *session, const char *path, off_t offset,
              const unsigned char *data, size_t data_length,
              char *error, size_t error_size);
