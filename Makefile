@@ -2,19 +2,21 @@ CC = gcc
 CFLAGS = -std=c11 -Wall -Wextra -Wpedantic -Werror -O2
 LDLIBS = -lrt
 
-COMMON_OBJECTS = protocol.o filesystem.o privilege.o
+SERVER_OBJECTS = server.o session.o transfer.o filesystem.o privilege.o \
+                 network.o utils.o
+CLIENT_OBJECTS = client.o client_transfer.o network.o utils.o
 
 .PHONY: all clean
 
 all: Server Client
 
-Server: server.o $(COMMON_OBJECTS)
+Server: $(SERVER_OBJECTS)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
 
-Client: client.o protocol.o
+Client: $(CLIENT_OBJECTS)
 	$(CC) $(CFLAGS) -o $@ $^
 
-%.o: %.c
+%.o: %.c $(wildcard *.h)
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 clean:

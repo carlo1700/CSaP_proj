@@ -2,7 +2,8 @@
 #define _XOPEN_SOURCE 700
 
 #include "filesystem.h"
-#include "protocol.h"
+#include "network.h"
+#include "utils.h"
 
 #include <dirent.h>
 #include <errno.h>
@@ -508,7 +509,7 @@ static int append_text(char **buffer, size_t *length, size_t *capacity,
     size_t text_length = strlen(text);
     char *new_buffer;
 
-    if (*length + text_length + 1 > PROTOCOL_MAX_FRAME) {
+    if (*length + text_length + 1 > NETWORK_MAX_FRAME) {
         errno = EOVERFLOW;
         return -1;
     }
@@ -683,7 +684,6 @@ int fs_write(const fs_session *session, const char *path, off_t offset,
 {
     char resolved[PATH_MAX];
     int descriptor;
-    size_t written = 0;
     int replace = offset < 0;
 
     if (replace) {
@@ -706,17 +706,10 @@ int fs_write(const fs_session *session, const char *path, off_t offset,
         close(descriptor);
         return -1;
     }
-    while (written < data_length) {
-        ssize_t count = write(descriptor, data + written, data_length - written);
-        if (count < 0 && errno == EINTR) {
-            continue;
-        }
-        if (count <= 0) {
-            set_error(error, error_size, "cannot write file");
-            close(descriptor);
-            return -1;
-        }
-        written += (size_t)count;
+    if (write_all(descriptor, data, data_length) < 0) {
+        set_error(error, error_size, "cannot write file");
+        close(descriptor);
+        return -1;
     }
     close(descriptor);
     return 0;

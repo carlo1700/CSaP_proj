@@ -14,12 +14,15 @@ configured root directory.
 
 | File | Role |
 |------|------|
-| `server.c` | accept loop, one forked handler per client, command dispatch, transfer requests |
-| `client.c` | interactive shell, upload/download (also in background), read/write |
-| `protocol.c/.h` | length-prefixed frames over TCP sockets |
+| `server.c` | startup, accept loop, one forked handler per client, console `exit`, reaping |
+| `session.c/.h` | one client session: command table and handlers (login, file commands, upload/read/download) |
+| `transfer.c/.h` | `transfer_request` / `accept` / `reject` over POSIX message queues |
 | `filesystem.c/.h` | sandboxed path resolution and all file operations with `flock` locking |
 | `privilege.c/.h` | euid management (root only when strictly needed) |
-| `transfer.h` | message formats for `transfer_request` (POSIX message queues) |
+| `network.c/.h` | length-prefixed frames over TCP, listening and connecting sockets |
+| `utils.c/.h` | helpers shared by client and server (I/O retries, argument parsing) |
+| `client.c` | interactive shell |
+| `client_transfer.c/.h` | client side of upload/download/read and background jobs |
 
 ## Compile
 
