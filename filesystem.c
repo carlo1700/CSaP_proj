@@ -1,5 +1,4 @@
-#define _DEFAULT_SOURCE
-#define _XOPEN_SOURCE 700
+#define _POSIX_C_SOURCE 200809L
 
 #include "filesystem.h"
 #include "network.h"
@@ -9,14 +8,12 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <grp.h>
-#include <limits.h>
 #include <pwd.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/file.h>
 #include <sys/stat.h>
-#include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -265,9 +262,10 @@ int fs_login(fs_session *session, const char *root, const char *username,
     return 0;
 }
 
-int fs_resolve_path(const fs_session *session, const char *path,
-                    int allow_missing_leaf, char *resolved, size_t resolved_size,
-                    char *error, size_t error_size)
+/* Resolves path inside the home, refusing symlinks; ".." stops at the home. */
+static int fs_resolve_path(const fs_session *session, const char *path,
+                           int allow_missing_leaf, char *resolved,
+                           size_t resolved_size, char *error, size_t error_size)
 {
     char combined[PATH_MAX];
     size_t home_length = strlen(session->home);

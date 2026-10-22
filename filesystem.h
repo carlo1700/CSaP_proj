@@ -3,9 +3,7 @@
 
 #include <limits.h>
 #include <stddef.h>
-#include <sys/stat.h>
 #include <sys/types.h>
-#include <stdint.h>
 
 typedef struct {
     char root[PATH_MAX];
@@ -21,9 +19,6 @@ int fs_create_user(const char *root, const char *username, mode_t permissions,
                    char *error, size_t error_size);
 int fs_login(fs_session *session, const char *root, const char *username,
              char *error, size_t error_size);
-int fs_resolve_path(const fs_session *session, const char *path,
-                    int allow_missing_leaf, char *resolved, size_t resolved_size,
-                    char *error, size_t error_size);
 int fs_create(const fs_session *session, const char *path, mode_t permissions,
               int directory, char *error, size_t error_size);
 int fs_chmod(const fs_session *session, const char *path, mode_t permissions,

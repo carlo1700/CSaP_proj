@@ -1,4 +1,3 @@
-#define _DEFAULT_SOURCE
 #define _POSIX_C_SOURCE 200809L
 
 #include "session.h"
@@ -27,7 +26,7 @@ typedef struct {
     pending_transfer *pending;
 } client_state;
 
-/* Handlers return 0 to go on, 1 to end the session, -1 on a broken connection. */
+/* Handlers return 0 to go on, -1 when the connection is broken. */
 typedef int (*command_handler)(int client_fd, client_state *state,
                                char **arguments, size_t argument_count);
 
@@ -115,16 +114,6 @@ static int command_create_user(int client_fd, client_state *state,
                             error, sizeof(error));
     privilege_lower();
     return reply(client_fd, result, error, "OK: user created\n");
-}
-
-static int command_exit(int client_fd, client_state *state,
-                        char **arguments, size_t argument_count)
-{
-    (void)client_fd;
-    (void)state;
-    (void)arguments;
-    (void)argument_count;
-    return 1;
 }
 
 static int command_create(int client_fd, client_state *state,
@@ -408,7 +397,6 @@ static const struct {
 } commands[] = {
     { "login", command_login, 0 },
     { "create_user", command_create_user, 0 },
-    { "exit", command_exit, 0 },
     { "create", command_create, 1 },
     { "chmod", command_chmod, 1 },
     { "move", command_move, 1 },
@@ -490,7 +478,7 @@ void session_serve(int client_fd, const char *root)
         }
         result = execute_command(client_fd, &state, (char *)request);
         free(request);
-        if (result != 0) {
+        if (result < 0) {
             break;
         }
     }
