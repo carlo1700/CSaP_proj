@@ -20,11 +20,32 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
-static void set_error(char *error, size_t error_size, const char *message)
+/* Error helpers: they fill the caller's error buffer and return -1. */
+static int fail(char *error, size_t error_size, const char *message)
 {
-    if (error_size > 0) {
-        snprintf(error, error_size, "%s: %s", message, strerror(errno));
-    }
+    snprintf(error, error_size, "%s: %s", message, strerror(errno));
+    return -1;
+}
+
+static int fail_with(char *error, size_t error_size, int code,
+                     const char *message)
+{
+    errno = code;
+    return fail(error, error_size, message);
+}
+
+static int fail_plain(char *error, size_t error_size, const char *message)
+{
+    snprintf(error, error_size, "%s", message);
+    return -1;
+}
+
+static int fail_close(int descriptor, char *error, size_t error_size,
+                      const char *message)
+{
+    fail(error, error_size, message);
+    close(descriptor);
+    return -1;
 }
 
 /*
@@ -61,12 +82,10 @@ static int valid_username(const char *username)
 {
     size_t i;
 
-    if (username == NULL || username[0] == '\0' ||
-        strlen(username) >= sizeof(((fs_session *)0)->username) ||
-        username[0] == '.') {
+    if (username == NULL || username[0] == '\0' || username[0] == '.' ||
+        strlen(username) >= sizeof(((fs_session *)0)->username)) {
         return 0;
     }
-
     for (i = 0; username[i] != '\0'; ++i) {
         unsigned char character = (unsigned char)username[i];
         if (!((character >= 'a' && character <= 'z') ||
@@ -79,65 +98,69 @@ static int valid_username(const char *username)
     return 1;
 }
 
+/* Puts <root>/users/<username> in path; 0 if it is an existing directory. */
+static int find_home(const char *root, const char *username, char *path,
+                     size_t path_size, struct stat *status)
+{
+    if (snprintf(path, path_size, "%s/users/%s", root, username) >=
+        (int)path_size) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+    if (lstat(path, status) < 0) {
+        return -1;
+    }
+    if (!S_ISDIR(status->st_mode)) {
+        errno = ENOTDIR;
+        return -1;
+    }
+    return 0;
+}
+
 int fs_initialize_root(const char *root_path, char *error, size_t error_size)
 {
     char canonical_root[PATH_MAX];
     char users_path[PATH_MAX];
+    struct group *shared_group = geteuid() == 0 ? getgrnam("users") : NULL;
     struct stat status;
-    int root_created = 0;
+    int root_created = mkdir(root_path, 0750) == 0;
 
-    if (mkdir(root_path, 0750) == 0) {
-        root_created = 1;
-    } else if (errno != EEXIST) {
-        set_error(error, error_size, "cannot create root directory");
-        return -1;
+    if (!root_created && errno != EEXIST) {
+        return fail(error, error_size, "cannot create root directory");
     }
     if (realpath(root_path, canonical_root) == NULL) {
-        set_error(error, error_size, "cannot resolve root directory");
-        return -1;
+        return fail(error, error_size, "cannot resolve root directory");
     }
     if (strcmp(canonical_root, "/") == 0) {
-        errno = EINVAL;
-        set_error(error, error_size, "server root cannot be the filesystem root");
-        return -1;
+        return fail_with(error, error_size, EINVAL,
+                         "server root cannot be the filesystem root");
     }
-    if (geteuid() == 0) {
-        struct group *shared_group = getgrnam("users");
-        if (root_created && shared_group == NULL) {
-            snprintf(error, error_size, "required shared system group 'users' is missing");
-            return -1;
-        }
-        if (root_created && shared_group != NULL &&
-            (chown(canonical_root, 0, shared_group->gr_gid) < 0 ||
-             chmod(canonical_root, 0711) < 0)) {
-            set_error(error, error_size, "cannot configure root directory");
-            return -1;
-        }
+    if (geteuid() == 0 && shared_group == NULL) {
+        return fail_plain(error, error_size,
+                          "required shared system group 'users' is missing");
+    }
+    if (root_created && shared_group != NULL &&
+        (chown(canonical_root, 0, shared_group->gr_gid) < 0 ||
+         chmod(canonical_root, 0711) < 0)) {
+        return fail(error, error_size, "cannot configure root directory");
     }
     if (snprintf(users_path, sizeof(users_path), "%s/users", canonical_root) >=
         (int)sizeof(users_path)) {
-        errno = ENAMETOOLONG;
-        set_error(error, error_size, "root directory path is too long");
-        return -1;
+        return fail_with(error, error_size, ENAMETOOLONG,
+                         "root directory path is too long");
     }
     if (mkdir(users_path, 0750) < 0 && errno != EEXIST) {
-        set_error(error, error_size, "cannot create users directory");
-        return -1;
+        return fail(error, error_size, "cannot create users directory");
     }
-    if (lstat(users_path, &status) < 0 || !S_ISDIR(status.st_mode) ||
-        S_ISLNK(status.st_mode)) {
-        errno = ENOTDIR;
-        set_error(error, error_size, "users path must be a directory");
-        return -1;
+    if (lstat(users_path, &status) < 0 || !S_ISDIR(status.st_mode)) {
+        return fail_with(error, error_size, ENOTDIR,
+                         "users path must be a directory");
     }
-    if (geteuid() == 0) {
-        struct group *shared_group = getgrnam("users");
-        if (shared_group != NULL &&
-            (chown(users_path, 0, shared_group->gr_gid) < 0 ||
-             chmod(users_path, 0750) < 0)) {
-            set_error(error, error_size, "cannot configure users directory");
-            return -1;
-        }
+    /* Group "users" may list the homes; "other" gets nothing. */
+    if (shared_group != NULL &&
+        (chown(users_path, 0, shared_group->gr_gid) < 0 ||
+         chmod(users_path, 0750) < 0)) {
+        return fail(error, error_size, "cannot configure users directory");
     }
     return 0;
 }
@@ -149,89 +172,62 @@ int fs_create_user(const char *root, const char *username, mode_t permissions,
     struct stat status;
     struct group *shared_group;
     struct passwd *user;
+    gid_t users_gid;
     pid_t child;
-    pid_t waited;
     int child_status;
 
     if (!valid_username(username)) {
-        snprintf(error, error_size, "invalid username");
-        return -1;
+        return fail_plain(error, error_size, "invalid username");
     }
     if (geteuid() != 0) {
-        snprintf(error, error_size,
-                 "create_user requires the server to run with root privileges");
-        return -1;
+        return fail_plain(error, error_size,
+                          "create_user requires the server to run with root privileges");
     }
     shared_group = getgrnam("users");
     if (shared_group == NULL) {
-        snprintf(error, error_size, "required shared system group 'users' is missing");
-        return -1;
+        return fail_plain(error, error_size,
+                          "required shared system group 'users' is missing");
     }
+    users_gid = shared_group->gr_gid;
     if (getpwnam(username) != NULL) {
-        snprintf(error, error_size, "a system user with that username already exists");
-        return -1;
+        return fail_plain(error, error_size,
+                          "a system user with that username already exists");
     }
-    if (snprintf(user_path, sizeof(user_path), "%s/users/%s", root, username) >=
-        (int)sizeof(user_path)) {
-        errno = ENAMETOOLONG;
-        set_error(error, error_size, "user path is too long");
-        return -1;
-    }
-    if (lstat(user_path, &status) == 0) {
-        snprintf(error, error_size, "a home directory with that username already exists");
-        return -1;
+    if (find_home(root, username, user_path, sizeof(user_path), &status) == 0) {
+        return fail_plain(error, error_size,
+                          "a home directory with that username already exists");
     }
     if (errno != ENOENT) {
-        set_error(error, error_size, "cannot check user home path");
-        return -1;
+        return fail(error, error_size, "cannot check user home path");
     }
+
     child = fork();
     if (child < 0) {
-        set_error(error, error_size, "cannot start adduser");
-        return -1;
+        return fail(error, error_size, "cannot start adduser");
     }
     if (child == 0) {
         execlp("adduser", "adduser", "--disabled-password", "--gecos", "",
                "--ingroup", "users", username, (char *)NULL);
         _exit(127);
     }
-    do {
-        waited = waitpid(child, &child_status, 0);
-    } while (waited < 0 && errno == EINTR);
-    if (waited < 0) {
-        set_error(error, error_size, "cannot wait for adduser");
-        return -1;
+    while (waitpid(child, &child_status, 0) < 0) {
+        if (errno != EINTR) {
+            return fail(error, error_size, "cannot wait for adduser");
+        }
     }
     if (!WIFEXITED(child_status) || WEXITSTATUS(child_status) != 0) {
-        snprintf(error, error_size, "adduser failed to create system account");
-        return -1;
+        return fail_plain(error, error_size, "adduser failed to create system account");
     }
     user = getpwnam(username);
-    if (user == NULL || user->pw_gid != shared_group->gr_gid) {
-        snprintf(error, error_size, "created account is not in the shared users group");
-        return -1;
+    if (user == NULL || user->pw_gid != users_gid) {
+        return fail_plain(error, error_size,
+                          "created account is not in the shared users group");
     }
-    if (mkdir(user_path, permissions) < 0) {
-        set_error(error, error_size, "cannot create user home");
-        return -1;
-    }
-    if (chmod(user_path, permissions) < 0) {
-        int saved_errno = errno;
-        rmdir(user_path);
-        errno = saved_errno;
-        set_error(error, error_size, "cannot set home permissions");
-        return -1;
-    }
-    if (lstat(user_path, &status) < 0 || !S_ISDIR(status.st_mode) ||
-        S_ISLNK(status.st_mode)) {
-        errno = ENOTDIR;
-        set_error(error, error_size, "user home is not a directory");
-        return -1;
-    }
-    if (chown(user_path, user->pw_uid, shared_group->gr_gid) < 0 ||
+    /* chmod after mkdir, because mkdir applies the umask. */
+    if (mkdir(user_path, permissions) < 0 ||
+        chown(user_path, user->pw_uid, users_gid) < 0 ||
         chmod(user_path, permissions) < 0) {
-        set_error(error, error_size, "cannot set user home ownership or permissions");
-        return -1;
+        return fail(error, error_size, "cannot create user home");
     }
     return 0;
 }
@@ -244,30 +240,19 @@ int fs_login(fs_session *session, const char *root, const char *username,
     struct passwd *user;
 
     if (!valid_username(username)) {
-        snprintf(error, error_size, "invalid username");
-        return -1;
+        return fail_plain(error, error_size, "invalid username");
     }
-    if (snprintf(user_path, sizeof(user_path), "%s/users/%s", root, username) >=
-        (int)sizeof(user_path)) {
-        errno = ENAMETOOLONG;
-        set_error(error, error_size, "user home path is too long");
-        return -1;
-    }
-    if (lstat(user_path, &status) < 0 || !S_ISDIR(status.st_mode) ||
-        S_ISLNK(status.st_mode)) {
-        errno = ENOENT;
-        set_error(error, error_size, "user does not exist");
-        return -1;
+    if (find_home(root, username, user_path, sizeof(user_path), &status) < 0) {
+        return fail_with(error, error_size, ENOENT, "user does not exist");
     }
     user = getpwnam(username);
     if (user == NULL) {
-        snprintf(error, error_size, "user has no corresponding system account");
-        return -1;
+        return fail_plain(error, error_size,
+                          "user has no corresponding system account");
     }
     if (status.st_uid != user->pw_uid) {
-        errno = EACCES;
-        set_error(error, error_size, "user home has the wrong system owner");
-        return -1;
+        return fail_with(error, error_size, EACCES,
+                         "user home has the wrong system owner");
     }
 
     snprintf(session->root, sizeof(session->root), "%s", root);
@@ -286,119 +271,72 @@ int fs_resolve_path(const fs_session *session, const char *path,
 {
     char combined[PATH_MAX];
     size_t home_length = strlen(session->home);
-    size_t output_length;
-    char *cursor;
+    size_t output_length = home_length;
+    char *cursor = combined;
     struct stat status;
 
-    if (path == NULL || path[0] == '\0') {
-        path = ".";
+    /* "/" is the home and relative paths start from the cwd. */
+    if (snprintf(combined, sizeof(combined), "%s/%s",
+                 path[0] == '/' ? "" : session->cwd, path) >=
+            (int)sizeof(combined) ||
+        home_length >= resolved_size) {
+        return fail_with(error, error_size, ENAMETOOLONG, "path is too long");
     }
-    if (path[0] == '/') {
-        if (snprintf(combined, sizeof(combined), "%s/%s", session->home,
-                     path + 1) >= (int)sizeof(combined)) {
-            errno = ENAMETOOLONG;
-            set_error(error, error_size, "path is too long");
-            return -1;
-        }
-    } else if (session->cwd[0] != '\0') {
-        if (snprintf(combined, sizeof(combined), "%s/%s/%s", session->home,
-                     session->cwd, path) >= (int)sizeof(combined)) {
-            errno = ENAMETOOLONG;
-            set_error(error, error_size, "path is too long");
-            return -1;
-        }
-    } else if (snprintf(combined, sizeof(combined), "%s/%s", session->home,
-                        path) >= (int)sizeof(combined)) {
-        errno = ENAMETOOLONG;
-        set_error(error, error_size, "path is too long");
-        return -1;
-    }
+    memcpy(resolved, session->home, home_length + 1);
 
-    if (strncmp(combined, session->home, home_length) != 0 ||
-        (combined[home_length] != '/' && combined[home_length] != '\0')) {
-        errno = EACCES;
-        set_error(error, error_size, "path escapes user home");
-        return -1;
-    }
-
-    if (snprintf(resolved, resolved_size, "%s", session->home) >=
-        (int)resolved_size) {
-        errno = ENAMETOOLONG;
-        set_error(error, error_size, "path is too long");
-        return -1;
-    }
-    output_length = strlen(resolved);
-    cursor = combined + home_length;
-    while (*cursor == '/') {
-        ++cursor;
-    }
-
-    while (*cursor != '\0') {
-        char *component = cursor;
-        size_t component_length;
+    /* Walks the path one component at a time, checking each with lstat. */
+    for (;;) {
+        char *component;
+        size_t length;
         int is_last;
 
-        while (*cursor != '\0' && *cursor != '/') {
-            ++cursor;
-        }
-        component_length = (size_t)(cursor - component);
         while (*cursor == '/') {
             ++cursor;
         }
-        is_last = (*cursor == '\0');
+        if (*cursor == '\0') {
+            return 0;
+        }
+        component = cursor;
+        while (*cursor != '\0' && *cursor != '/') {
+            ++cursor;
+        }
+        length = (size_t)(cursor - component);
+        is_last = cursor[strspn(cursor, "/")] == '\0';
 
-        if (component_length == 0 ||
-            (component_length == 1 && component[0] == '.')) {
+        if (length == 1 && component[0] == '.') {
             continue;
         }
-        if (component_length == 2 && component[0] == '.' &&
-            component[1] == '.') {
-            if (output_length > home_length) {
-                while (output_length > home_length &&
-                       resolved[output_length - 1] != '/') {
-                    --output_length;
-                }
-                if (output_length > home_length) {
-                    --output_length;
-                }
-                resolved[output_length] = '\0';
+        if (length == 2 && component[0] == '.' && component[1] == '.') {
+            /* ".." removes the last component, but never goes above the home. */
+            while (output_length > home_length &&
+                   resolved[--output_length] != '/') {
             }
+            resolved[output_length] = '\0';
             continue;
         }
-
-        if (output_length + component_length + 2 > resolved_size) {
-            errno = ENAMETOOLONG;
-            set_error(error, error_size, "path is too long");
-            return -1;
+        if (output_length + length + 2 > resolved_size) {
+            return fail_with(error, error_size, ENAMETOOLONG, "path is too long");
         }
         resolved[output_length++] = '/';
-        memcpy(resolved + output_length, component, component_length);
-        output_length += component_length;
+        memcpy(resolved + output_length, component, length);
+        output_length += length;
         resolved[output_length] = '\0';
 
         if (lstat(resolved, &status) < 0) {
             if (errno == ENOENT && allow_missing_leaf && is_last) {
                 return 0;
             }
-            set_error(error, error_size, "cannot access path");
-            return -1;
+            return fail(error, error_size, "cannot access path");
         }
         if (S_ISLNK(status.st_mode)) {
-            errno = EACCES;
-            set_error(error, error_size, "symbolic links are not allowed");
-            return -1;
+            return fail_with(error, error_size, EACCES,
+                             "symbolic links are not allowed");
         }
         if (!is_last && !S_ISDIR(status.st_mode)) {
-            errno = ENOTDIR;
-            set_error(error, error_size, "path component is not a directory");
-            return -1;
+            return fail_with(error, error_size, ENOTDIR,
+                             "path component is not a directory");
         }
     }
-
-    if (output_length == home_length) {
-        resolved[home_length] = '\0';
-    }
-    return 0;
 }
 
 int fs_create(const fs_session *session, const char *path, mode_t permissions,
@@ -411,25 +349,23 @@ int fs_create(const fs_session *session, const char *path, mode_t permissions,
                         error, error_size) < 0) {
         return -1;
     }
+    /* chmod after mkdir/open, because they apply the umask. */
     if (directory) {
         if (mkdir(resolved, permissions) < 0 || chmod(resolved, permissions) < 0) {
-            set_error(error, error_size, "cannot create directory");
-            return -1;
+            return fail(error, error_size, "cannot create directory");
         }
-    } else {
-        descriptor = open(resolved, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW,
-                          permissions);
-        if (descriptor < 0) {
-            set_error(error, error_size, "cannot create file");
-            return -1;
-        }
-        if (fchmod(descriptor, permissions) < 0) {
-            set_error(error, error_size, "cannot set file permissions");
-            close(descriptor);
-            return -1;
-        }
-        close(descriptor);
+        return 0;
     }
+    descriptor = open(resolved, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW,
+                      permissions);
+    if (descriptor < 0) {
+        return fail(error, error_size, "cannot create file");
+    }
+    if (fchmod(descriptor, permissions) < 0) {
+        return fail_close(descriptor, error, error_size,
+                          "cannot set file permissions");
+    }
+    close(descriptor);
     return 0;
 }
 
@@ -447,7 +383,7 @@ int fs_chmod(const fs_session *session, const char *path, mode_t permissions,
     descriptor = open_locked(resolved, LOCK_EX);
     result = chmod(resolved, permissions);
     if (result < 0) {
-        set_error(error, error_size, "cannot change permissions");
+        fail(error, error_size, "cannot change permissions");
     }
     close_locked(descriptor);
     return result;
@@ -470,9 +406,7 @@ int fs_move(const fs_session *session, const char *source, const char *destinati
         return -1;
     }
     if (strcmp(source_path, session->home) == 0) {
-        errno = EBUSY;
-        set_error(error, error_size, "cannot move user home");
-        return -1;
+        return fail_with(error, error_size, EBUSY, "cannot move user home");
     }
     /* Like mv: moving onto an existing directory places the source inside it. */
     if (stat(destination_path, &status) == 0 && S_ISDIR(status.st_mode)) {
@@ -480,9 +414,8 @@ int fs_move(const fs_session *session, const char *source, const char *destinati
         if (snprintf(destination_path + length, sizeof(destination_path) - length,
                      "/%s", strrchr(source_path, '/') + 1) >=
             (int)(sizeof(destination_path) - length)) {
-            errno = ENAMETOOLONG;
-            set_error(error, error_size, "destination path is too long");
-            return -1;
+            return fail_with(error, error_size, ENAMETOOLONG,
+                             "destination path is too long");
         }
     }
     /* Fixed lock order, so that "move a b" and "move b a" cannot deadlock. */
@@ -496,52 +429,23 @@ int fs_move(const fs_session *session, const char *source, const char *destinati
     }
     result = rename(source_path, destination_path);
     if (result < 0) {
-        set_error(error, error_size, "cannot move path");
+        fail(error, error_size, "cannot move path");
     }
     close_locked(destination_fd);
     close_locked(source_fd);
     return result;
 }
 
-static int append_text(char **buffer, size_t *length, size_t *capacity,
-                       const char *text)
-{
-    size_t text_length = strlen(text);
-    char *new_buffer;
-
-    if (*length + text_length + 1 > NETWORK_MAX_FRAME) {
-        errno = EOVERFLOW;
-        return -1;
-    }
-    if (*length + text_length + 1 > *capacity) {
-        size_t new_capacity = *capacity == 0 ? 1024 : *capacity;
-        while (new_capacity < *length + text_length + 1) {
-            new_capacity *= 2;
-        }
-        new_buffer = realloc(*buffer, new_capacity);
-        if (new_buffer == NULL) {
-            return -1;
-        }
-        *buffer = new_buffer;
-        *capacity = new_capacity;
-    }
-    memcpy(*buffer + *length, text, text_length);
-    *length += text_length;
-    (*buffer)[*length] = '\0';
-    return 0;
-}
-
+/* Builds "<permissions>\t<name>\t<size> bytes" lines in a memory stream. */
 static int list_directory(const fs_session *session, const char *path,
                           char **output, size_t *output_length,
                           char *error, size_t error_size)
 {
     char resolved[PATH_MAX];
-    char line[PATH_MAX + 128];
-    char *buffer = NULL;
-    size_t length = 0;
-    size_t capacity = 0;
-    DIR *directory;
     struct dirent *entry;
+    DIR *directory;
+    FILE *listing;
+    int result = 0;
 
     if (fs_resolve_path(session, path, 0, resolved, sizeof(resolved),
                         error, error_size) < 0) {
@@ -549,75 +453,56 @@ static int list_directory(const fs_session *session, const char *path,
     }
     directory = opendir(resolved);
     if (directory == NULL) {
-        set_error(error, error_size, "cannot list directory");
+        return fail(error, error_size, "cannot list directory");
+    }
+    listing = open_memstream(output, output_length);
+    if (listing == NULL) {
+        fail(error, error_size, "cannot list directory");
+        closedir(directory);
         return -1;
     }
 
     errno = 0;
     while ((entry = readdir(directory)) != NULL) {
         char entry_path[PATH_MAX];
-        struct stat status;
         char permissions[10];
-        int written;
+        struct stat status;
+        int too_long;
+        int bit;
 
-        if (strcmp(entry->d_name, ".") == 0 ||
-            strcmp(entry->d_name, "..") == 0) {
+        if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) {
             continue;
         }
-        if (snprintf(entry_path, sizeof(entry_path), "%s/%s", resolved,
-                     entry->d_name) >= (int)sizeof(entry_path)) {
-            errno = ENAMETOOLONG;
-            set_error(error, error_size, "directory entry path is too long");
-            free(buffer);
-            closedir(directory);
-            return -1;
+        too_long = snprintf(entry_path, sizeof(entry_path), "%s/%s", resolved,
+                            entry->d_name) >= (int)sizeof(entry_path);
+        if (too_long || lstat(entry_path, &status) < 0) {
+            result = fail_with(error, error_size, too_long ? ENAMETOOLONG : errno,
+                               "cannot read directory entry");
+            break;
         }
-        if (lstat(entry_path, &status) < 0) {
-            set_error(error, error_size, "cannot read directory entry");
-            free(buffer);
-            closedir(directory);
-            return -1;
+        for (bit = 0; bit < 9; ++bit) {
+            permissions[bit] = status.st_mode & (0400 >> bit) ? "rwxrwxrwx"[bit] : '-';
         }
-        snprintf(permissions, sizeof(permissions), "%c%c%c%c%c%c%c%c%c",
-                 status.st_mode & S_IRUSR ? 'r' : '-',
-                 status.st_mode & S_IWUSR ? 'w' : '-',
-                 status.st_mode & S_IXUSR ? 'x' : '-',
-                 status.st_mode & S_IRGRP ? 'r' : '-',
-                 status.st_mode & S_IWGRP ? 'w' : '-',
-                 status.st_mode & S_IXGRP ? 'x' : '-',
-                 status.st_mode & S_IROTH ? 'r' : '-',
-                 status.st_mode & S_IWOTH ? 'w' : '-',
-                 status.st_mode & S_IXOTH ? 'x' : '-');
-        written = snprintf(line, sizeof(line), "%s\t%s\t%lld bytes\n",
-                           permissions, entry->d_name,
-                           (long long)status.st_size);
-        if (written < 0 || (size_t)written >= sizeof(line) ||
-            append_text(&buffer, &length, &capacity, line) < 0) {
-            errno = EOVERFLOW;
-            set_error(error, error_size, "directory listing is too large");
-            free(buffer);
-            closedir(directory);
-            return -1;
-        }
+        permissions[9] = '\0';
+        fprintf(listing, "%s\t%s\t%lld bytes\n", permissions, entry->d_name,
+                (long long)status.st_size);
         errno = 0;
     }
-    if (errno != 0) {
-        set_error(error, error_size, "cannot read directory");
-        free(buffer);
-        closedir(directory);
-        return -1;
+    if (result == 0 && errno != 0) {
+        result = fail(error, error_size, "cannot read directory");
     }
     closedir(directory);
-
-    if (buffer == NULL) {
-        buffer = calloc(1, 1);
-        if (buffer == NULL) {
-            return -1;
-        }
+    if (fclose(listing) != 0 && result == 0) {
+        result = fail(error, error_size, "cannot build directory listing");
     }
-    *output = buffer;
-    *output_length = length;
-    return 0;
+    if (result == 0 && *output_length > NETWORK_MAX_FRAME) {
+        result = fail_with(error, error_size, EOVERFLOW,
+                           "directory listing is too large");
+    }
+    if (result < 0) {
+        free(*output);
+    }
+    return result;
 }
 
 /*
@@ -638,9 +523,7 @@ int fs_list(const fs_session *session, const char *path, char **output,
         (path[0] == '/' &&
          snprintf(absolute, sizeof(absolute), "/%s%s", session->username,
                   path) >= (int)sizeof(absolute))) {
-        errno = ENAMETOOLONG;
-        set_error(error, error_size, "path is too long");
-        return -1;
+        return fail_with(error, error_size, ENAMETOOLONG, "path is too long");
     }
     if (path[0] == '/') {
         path = absolute;
@@ -653,28 +536,18 @@ int fs_list_other(const fs_session *session, const char *username,
                   const char *path, char **output, size_t *output_length,
                   char *error, size_t error_size)
 {
-    fs_session other_session = *session;
+    fs_session other = *session;
     struct stat status;
 
     if (!valid_username(username)) {
-        snprintf(error, error_size, "invalid username in list path");
-        return -1;
+        return fail_plain(error, error_size, "invalid username in list path");
     }
-    if (snprintf(other_session.home, sizeof(other_session.home),
-                 "%s/users/%s", session->root, username) >=
-        (int)sizeof(other_session.home)) {
-        errno = ENAMETOOLONG;
-        set_error(error, error_size, "user home path is too long");
-        return -1;
+    if (find_home(session->root, username, other.home, sizeof(other.home),
+                  &status) < 0) {
+        return fail_with(error, error_size, ENOENT, "user home does not exist");
     }
-    if (lstat(other_session.home, &status) < 0 || !S_ISDIR(status.st_mode) ||
-        S_ISLNK(status.st_mode)) {
-        errno = ENOENT;
-        set_error(error, error_size, "user home does not exist");
-        return -1;
-    }
-    other_session.cwd[0] = '\0';
-    return list_directory(&other_session, path, output, output_length,
+    other.cwd[0] = '\0';
+    return list_directory(&other, path, output, output_length,
                           error, error_size);
 }
 
@@ -686,30 +559,22 @@ int fs_write(const fs_session *session, const char *path, off_t offset,
     int descriptor;
     int replace = offset < 0;
 
-    if (replace) {
-        offset = 0;
-    }
     if (fs_resolve_path(session, path, 1, resolved, sizeof(resolved),
                         error, error_size) < 0) {
         return -1;
     }
-    descriptor = open(resolved, O_WRONLY | O_CREAT | O_NOFOLLOW,
-                      0700);
+    descriptor = open(resolved, O_WRONLY | O_CREAT | O_NOFOLLOW, 0700);
     if (descriptor < 0) {
-        set_error(error, error_size, "cannot open file for writing");
-        return -1;
+        return fail(error, error_size, "cannot open file for writing");
     }
     if (flock(descriptor, LOCK_EX) < 0 ||
         (replace && ftruncate(descriptor, 0) < 0) ||
-        lseek(descriptor, offset, SEEK_SET) < 0) {
-        set_error(error, error_size, "cannot lock or seek file for writing");
-        close(descriptor);
-        return -1;
+        lseek(descriptor, replace ? 0 : offset, SEEK_SET) < 0) {
+        return fail_close(descriptor, error, error_size,
+                          "cannot lock or seek file for writing");
     }
     if (write_all(descriptor, data, data_length) < 0) {
-        set_error(error, error_size, "cannot write file");
-        close(descriptor);
-        return -1;
+        return fail_close(descriptor, error, error_size, "cannot write file");
     }
     close(descriptor);
     return 0;
@@ -728,26 +593,20 @@ int fs_delete(const fs_session *session, const char *path,
         return -1;
     }
     if (strcmp(resolved, session->home) == 0) {
-        errno = EBUSY;
-        set_error(error, error_size, "cannot delete user home");
-        return -1;
+        return fail_with(error, error_size, EBUSY, "cannot delete user home");
     }
     if (lstat(resolved, &status) < 0) {
-        set_error(error, error_size, "cannot access path to delete");
-        return -1;
+        return fail(error, error_size, "cannot access path to delete");
     }
     if (S_ISDIR(status.st_mode)) {
-        if (rmdir(resolved) < 0) {
-            set_error(error, error_size, "cannot delete directory");
-            return -1;
-        }
-        return 0;
+        return rmdir(resolved) < 0
+                   ? fail(error, error_size, "cannot delete directory") : 0;
     }
     /* Deleting is a write: wait for readers and writers to finish. */
     descriptor = open_locked(resolved, LOCK_EX);
     result = unlink(resolved);
     if (result < 0) {
-        set_error(error, error_size, "cannot delete file");
+        fail(error, error_size, "cannot delete file");
     }
     close_locked(descriptor);
     return result;
@@ -758,60 +617,44 @@ int fs_change_directory(fs_session *session, const char *path,
 {
     char resolved[PATH_MAX];
     struct stat status;
-    size_t home_length;
+    size_t home_length = strlen(session->home);
 
     if (fs_resolve_path(session, path, 0, resolved, sizeof(resolved),
                         error, error_size) < 0) {
         return -1;
     }
     if (stat(resolved, &status) < 0 || !S_ISDIR(status.st_mode)) {
-        errno = ENOTDIR;
-        set_error(error, error_size, "not a directory");
-        return -1;
+        return fail_with(error, error_size, ENOTDIR, "not a directory");
     }
-    home_length = strlen(session->home);
-    if (resolved[home_length] == '\0') {
-        session->cwd[0] = '\0';
-    } else {
-        snprintf(session->cwd, sizeof(session->cwd), "%s",
-                 resolved + home_length + 1);
-    }
+    snprintf(session->cwd, sizeof(session->cwd), "%s",
+             resolved[home_length] == '\0' ? "" : resolved + home_length + 1);
     return 0;
 }
 
 int fs_upload_begin(const fs_session *session, const char *path, int *file_fd,
                     char *error, size_t error_size)
 {
+    char resolved[PATH_MAX];
     struct stat status;
     int descriptor;
-    char resolved[PATH_MAX];
 
     if (fs_resolve_path(session, path, 1, resolved, sizeof(resolved),
                         error, error_size) < 0) {
         return -1;
     }
-    if (strcmp(resolved, session->home) == 0) {
-        errno = EISDIR;
-        set_error(error, error_size, "upload destination must be a file path");
-        return -1;
-    }
     descriptor = open(resolved, O_WRONLY | O_CREAT | O_NOFOLLOW | O_NONBLOCK,
                       0600);
     if (descriptor < 0) {
-        set_error(error, error_size, "cannot open upload destination");
-        return -1;
+        return fail(error, error_size, "cannot open upload destination");
     }
     if (fstat(descriptor, &status) < 0 || !S_ISREG(status.st_mode)) {
         errno = EINVAL;
-        set_error(error, error_size, "upload destination must be a regular file");
-        close(descriptor);
-        return -1;
+        return fail_close(descriptor, error, error_size,
+                          "upload destination must be a regular file");
     }
-    if (flock(descriptor, LOCK_EX) < 0 || ftruncate(descriptor, 0) < 0 ||
-        lseek(descriptor, 0, SEEK_SET) < 0) {
-        set_error(error, error_size, "cannot lock or prepare upload destination");
-        close(descriptor);
-        return -1;
+    if (flock(descriptor, LOCK_EX) < 0 || ftruncate(descriptor, 0) < 0) {
+        return fail_close(descriptor, error, error_size,
+                          "cannot lock or prepare upload destination");
     }
     *file_fd = descriptor;
     return 0;
@@ -820,24 +663,13 @@ int fs_upload_begin(const fs_session *session, const char *path, int *file_fd,
 int fs_upload_finish(int file_fd, int commit,
                      char *error, size_t error_size)
 {
-    int result = 0;
+    /* An interrupted upload leaves an empty file rather than a partial one. */
+    int result = commit ? 0 : ftruncate(file_fd, 0);
 
-    if (!commit && ftruncate(file_fd, 0) < 0) {
-        set_error(error, error_size, "cannot clear incomplete upload");
-        result = -1;
+    if (close(file_fd) < 0 || result < 0) {
+        return fail(error, error_size, "cannot finish upload");
     }
-    if (close(file_fd) < 0) {
-        if (result == 0) {
-            set_error(error, error_size, "cannot close uploaded file");
-        }
-        result = -1;
-    }
-    if (!commit && result == 0) {
-        errno = EIO;
-        set_error(error, error_size, "upload did not complete");
-        result = -1;
-    }
-    return result;
+    return 0;
 }
 
 int fs_download_open(const fs_session *session, const char *path, int *file_fd,
@@ -853,19 +685,15 @@ int fs_download_open(const fs_session *session, const char *path, int *file_fd,
     }
     descriptor = open(resolved, O_RDONLY | O_NOFOLLOW);
     if (descriptor < 0) {
-        set_error(error, error_size, "cannot open file for download");
-        return -1;
+        return fail(error, error_size, "cannot open file");
     }
     if (fstat(descriptor, &status) < 0 || !S_ISREG(status.st_mode)) {
         errno = EINVAL;
-        set_error(error, error_size, "download source must be a regular file");
-        close(descriptor);
-        return -1;
+        return fail_close(descriptor, error, error_size,
+                          "path is not a regular file");
     }
     if (flock(descriptor, LOCK_SH) < 0) {
-        set_error(error, error_size, "cannot lock file for download");
-        close(descriptor);
-        return -1;
+        return fail_close(descriptor, error, error_size, "cannot lock file");
     }
     *file_fd = descriptor;
     return 0;
@@ -875,44 +703,16 @@ int fs_transfer_source(const fs_session *session, const char *path, int *file_fd
                        char *filename, size_t filename_size,
                        char *error, size_t error_size)
 {
-    char resolved[PATH_MAX];
-    const char *leaf;
-    int descriptor;
+    const char *slash = strrchr(path, '/');
+    const char *leaf = slash == NULL ? path : slash + 1;
 
-    if (fs_resolve_path(session, path, 0, resolved, sizeof(resolved),
-                        error, error_size) < 0) {
-        return -1;
-    }
-    leaf = strrchr(resolved, '/');
-    leaf = leaf == NULL ? resolved : leaf + 1;
-    if (leaf[0] == '\0' || strcmp(leaf, ".") == 0 ||
-        strcmp(leaf, "..") == 0 ||
+    /* A regular file cannot end with "." or "..", which name directories. */
+    if (leaf[0] == '\0' ||
         snprintf(filename, filename_size, "%s", leaf) >= (int)filename_size) {
-        errno = EINVAL;
-        set_error(error, error_size, "invalid transfer source filename");
-        return -1;
+        return fail_with(error, error_size, EINVAL,
+                         "invalid transfer source filename");
     }
-    descriptor = open(resolved, O_RDONLY | O_NOFOLLOW);
-    if (descriptor < 0) {
-        set_error(error, error_size, "cannot open transfer source");
-        return -1;
-    }
-    {
-        struct stat status;
-        if (fstat(descriptor, &status) < 0 || !S_ISREG(status.st_mode)) {
-            errno = EINVAL;
-            set_error(error, error_size, "transfer source must be a regular file");
-            close(descriptor);
-            return -1;
-        }
-    }
-    if (flock(descriptor, LOCK_SH) < 0) {
-        set_error(error, error_size, "cannot lock transfer source");
-        close(descriptor);
-        return -1;
-    }
-    *file_fd = descriptor;
-    return 0;
+    return fs_download_open(session, path, file_fd, error, error_size);
 }
 
 int fs_transfer_target(const fs_session *session, const char *directory,
@@ -923,38 +723,30 @@ int fs_transfer_target(const fs_session *session, const char *directory,
     struct stat status;
     int descriptor;
 
-    if (filename == NULL || filename[0] == '\0' ||
-        strchr(filename, '/') != NULL ||
+    if (filename[0] == '\0' || strchr(filename, '/') != NULL ||
         strcmp(filename, ".") == 0 || strcmp(filename, "..") == 0) {
-        errno = EINVAL;
-        set_error(error, error_size, "invalid transfer filename");
-        return -1;
+        return fail_with(error, error_size, EINVAL, "invalid transfer filename");
     }
     if (fs_resolve_path(session, directory, 0, resolved_directory,
                         sizeof(resolved_directory), error, error_size) < 0) {
         return -1;
     }
     if (stat(resolved_directory, &status) < 0 || !S_ISDIR(status.st_mode)) {
-        errno = ENOTDIR;
-        set_error(error, error_size, "transfer destination is not a directory");
-        return -1;
+        return fail_with(error, error_size, ENOTDIR,
+                         "transfer destination is not a directory");
     }
     if (snprintf(target_path, target_path_size, "%s/%s",
                  resolved_directory, filename) >= (int)target_path_size) {
-        errno = ENAMETOOLONG;
-        set_error(error, error_size, "transfer destination path is too long");
-        return -1;
+        return fail_with(error, error_size, ENAMETOOLONG,
+                         "transfer destination path is too long");
     }
     descriptor = open(target_path,
-                      O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_NONBLOCK,
-                      0600);
+                      O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_NONBLOCK, 0600);
     if (descriptor < 0) {
-        set_error(error, error_size, "cannot create transfer destination");
-        return -1;
+        return fail(error, error_size, "cannot create transfer destination");
     }
     if (flock(descriptor, LOCK_EX) < 0) {
-        set_error(error, error_size, "cannot lock transfer destination");
-        close(descriptor);
+        fail_close(descriptor, error, error_size, "cannot lock transfer destination");
         unlink(target_path);
         return -1;
     }
@@ -965,23 +757,12 @@ int fs_transfer_target(const fs_session *session, const char *directory,
 int fs_transfer_finish(int file_fd, const char *target_path, int commit,
                        char *error, size_t error_size)
 {
-    int result = 0;
+    int result = close(file_fd) < 0 && commit
+                     ? fail(error, error_size, "cannot close transferred file") : 0;
 
-    if (!commit && ftruncate(file_fd, 0) < 0) {
-        set_error(error, error_size, "cannot clear incomplete transfer");
-        result = -1;
-    }
-    if (close(file_fd) < 0) {
-        if (result == 0) {
-            set_error(error, error_size, "cannot close transferred file");
-        }
-        result = -1;
-    }
+    /* A failed transfer leaves no file behind. */
     if (!commit || result < 0) {
-        if (unlink(target_path) < 0 && errno != ENOENT && result == 0) {
-            set_error(error, error_size, "cannot remove incomplete transfer");
-            result = -1;
-        }
+        unlink(target_path);
     }
     return result;
 }

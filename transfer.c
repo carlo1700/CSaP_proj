@@ -344,64 +344,40 @@ int transfer_request(int client_fd, const fs_session *session,
 
 /* ---------- recipient side ---------- */
 
+/* The queue must be named <prefix><sender pid>_<nonce> and owned by the sender. */
+static int sender_queue(const transfer_request_message *request,
+                        const char *name, const char *prefix,
+                        unsigned long long *nonce)
+{
+    size_t prefix_length = strlen(prefix);
+    char queue_path[128];
+    struct stat status;
+    long pid;
+    char trailing;
+
+    return strncmp(name, prefix, prefix_length) == 0 &&
+           sscanf(name + prefix_length, "%ld_%llu%c", &pid, nonce, &trailing) == 2 &&
+           pid == (long)request->sender_pid &&
+           snprintf(queue_path, sizeof(queue_path), "/dev/mqueue/%s", name + 1) <
+               (int)sizeof(queue_path) &&
+           stat(queue_path, &status) == 0 && status.st_uid == request->sender_uid;
+}
+
 /* Rejects forged or stale requests: the queues must belong to a live sender. */
 static int valid_pending_request(const transfer_request_message *request)
 {
-    struct passwd *sender;
-    char queue_path[128];
-    struct stat status;
-    int written;
-    long queue_pid;
-    unsigned long long queue_nonce;
-    long data_pid;
+    struct passwd *sender = getpwnam(request->sender);
+    unsigned long long reply_nonce;
     unsigned long long data_nonce;
-    char trailing_character;
 
-    if (request->type != TRANSFER_REQUEST ||
-        memchr(request->request_id, '\0', sizeof(request->request_id)) == NULL ||
-        memchr(request->sender, '\0', sizeof(request->sender)) == NULL ||
-        memchr(request->filename, '\0', sizeof(request->filename)) == NULL ||
-        memchr(request->reply_queue, '\0', sizeof(request->reply_queue)) == NULL ||
-        memchr(request->data_queue, '\0', sizeof(request->data_queue)) == NULL ||
-        request->request_id[0] == '\0' ||
-        request->sender[0] == '\0' ||
-        request->filename[0] == '\0' ||
-        strncmp(request->reply_queue, TRANSFER_REPLY_PREFIX,
-                strlen(TRANSFER_REPLY_PREFIX)) != 0 ||
-        strncmp(request->data_queue, TRANSFER_DATA_PREFIX,
-                strlen(TRANSFER_DATA_PREFIX)) != 0 ||
-        request->sender_pid <= 0) {
-        return 0;
-    }
-    if (kill(request->sender_pid, 0) < 0 && errno == ESRCH) {
-        return 0;
-    }
-    if (sscanf(request->reply_queue, TRANSFER_REPLY_PREFIX "%ld_%llu%c",
-               &queue_pid, &queue_nonce, &trailing_character) != 2 ||
-        queue_pid != (long)request->sender_pid ||
-        sscanf(request->data_queue, TRANSFER_DATA_PREFIX "%ld_%llu%c",
-               &data_pid, &data_nonce, &trailing_character) != 2 ||
-        data_pid != (long)request->sender_pid ||
-        data_nonce != queue_nonce) {
-        return 0;
-    }
-    sender = getpwnam(request->sender);
-    if (sender == NULL || sender->pw_uid != request->sender_uid) {
-        return 0;
-    }
-    written = snprintf(queue_path, sizeof(queue_path), "/dev/mqueue/%s",
-                       request->reply_queue + 1);
-    if (written < 0 || (size_t)written >= sizeof(queue_path) ||
-        stat(queue_path, &status) < 0 || status.st_uid != request->sender_uid) {
-        return 0;
-    }
-    written = snprintf(queue_path, sizeof(queue_path), "/dev/mqueue/%s",
-                       request->data_queue + 1);
-    if (written < 0 || (size_t)written >= sizeof(queue_path) ||
-        stat(queue_path, &status) < 0 || status.st_uid != request->sender_uid) {
-        return 0;
-    }
-    return 1;
+    return request->type == TRANSFER_REQUEST && request->sender_pid > 0 &&
+           sender != NULL && sender->pw_uid == request->sender_uid &&
+           !(kill(request->sender_pid, 0) < 0 && errno == ESRCH) &&
+           sender_queue(request, request->reply_queue, TRANSFER_REPLY_PREFIX,
+                        &reply_nonce) &&
+           sender_queue(request, request->data_queue, TRANSFER_DATA_PREFIX,
+                        &data_nonce) &&
+           reply_nonce == data_nonce;
 }
 
 static int send_decision(const transfer_request_message *request, int type)
@@ -429,6 +405,12 @@ int transfer_notify(mqd_t inbox, int client_fd, pending_transfer **pending)
     if (received < 0) {
         return errno == EAGAIN || errno == EINTR ? 0 : -1;
     }
+    /* Strings come from another process: make sure they are terminated. */
+    request.request_id[sizeof(request.request_id) - 1] = '\0';
+    request.sender[sizeof(request.sender) - 1] = '\0';
+    request.filename[sizeof(request.filename) - 1] = '\0';
+    request.reply_queue[sizeof(request.reply_queue) - 1] = '\0';
+    request.data_queue[sizeof(request.data_queue) - 1] = '\0';
     if ((size_t)received != sizeof(request) || !valid_pending_request(&request)) {
         return 0;
     }
@@ -453,49 +435,12 @@ int transfer_notify(mqd_t inbox, int client_fd, pending_transfer **pending)
     return send_text(client_fd, notification);
 }
 
-static int receive_accepted_file(int client_fd, const fs_session *session,
-                                 const transfer_request_message *request,
-                                 const char *directory)
+/* Writes the chunks until TRANSFER_END; on failure leaves a message in error. */
+static void receive_chunks(mqd_t data_queue, pid_t sender_pid, int target_fd,
+                           char *error, size_t error_size)
 {
-    transfer_reply_message reply = {0};
-    char target_path[PATH_MAX];
-    char error[512];
-    mqd_t sender_queue;
-    mqd_t data_queue;
-    int target_fd;
-    int failed = 0;
+    transfer_reply_message chunk;
     int idle_seconds = 0;
-
-    if (!valid_pending_request(request)) {
-        return send_error(client_fd, "sender is no longer online");
-    }
-    sender_queue = mq_open(request->reply_queue, O_WRONLY);
-    if (sender_queue == (mqd_t)-1) {
-        return send_error(client_fd, "cannot contact transfer sender");
-    }
-    data_queue = mq_open(request->data_queue, O_RDONLY);
-    if (data_queue == (mqd_t)-1) {
-        mq_close(sender_queue);
-        return send_error(client_fd, "cannot open transfer data channel");
-    }
-    if (fs_transfer_target(session, directory, request->filename,
-                           &target_fd, target_path, sizeof(target_path),
-                           error, sizeof(error)) < 0) {
-        reply.type = TRANSFER_ERROR;
-        snprintf(reply.payload.error, sizeof(reply.payload.error), "%.255s", error);
-        mq_send(sender_queue, (const char *)&reply, sizeof(reply), 0);
-        mq_close(sender_queue);
-        mq_close(data_queue);
-        return send_error(client_fd, error);
-    }
-
-    reply.type = TRANSFER_ACCEPT;
-    if (mq_send(sender_queue, (const char *)&reply, sizeof(reply), 0) < 0) {
-        fs_transfer_finish(target_fd, target_path, 0, error, sizeof(error));
-        mq_close(sender_queue);
-        mq_close(data_queue);
-        return send_error(client_fd, "cannot notify transfer sender");
-    }
 
     for (;;) {
         struct timespec deadline;
@@ -503,61 +448,87 @@ static int receive_accepted_file(int client_fd, const fs_session *session,
 
         clock_gettime(CLOCK_REALTIME, &deadline);
         ++deadline.tv_sec;
-        received = mq_timedreceive(data_queue, (char *)&reply,
-                                   sizeof(reply), NULL, &deadline);
+        received = mq_timedreceive(data_queue, (char *)&chunk, sizeof(chunk),
+                                   NULL, &deadline);
         if (received < 0 && (errno == EINTR || errno == ETIMEDOUT)) {
-            if ((kill(request->sender_pid, 0) < 0 && errno == ESRCH) ||
+            if ((kill(sender_pid, 0) < 0 && errno == ESRCH) ||
                 ++idle_seconds >= TRANSFER_STALL_SECONDS) {
-                failed = 1;
-                snprintf(error, sizeof(error), "transfer sender disconnected");
-                break;
+                snprintf(error, error_size, "transfer sender disconnected");
+                return;
             }
             continue;
         }
         idle_seconds = 0;
-        if (received != (ssize_t)sizeof(reply)) {
-            failed = 1;
-            snprintf(error, sizeof(error), "cannot receive transfer data");
-            break;
+        if (received != (ssize_t)sizeof(chunk)) {
+            snprintf(error, error_size, "cannot receive transfer data");
+            return;
         }
-        if (reply.type == TRANSFER_END) {
-            break;
+        if (chunk.type == TRANSFER_END) {
+            return;
         }
-        if (reply.type == TRANSFER_ERROR) {
-            failed = 1;
-            snprintf(error, sizeof(error), "%.255s", reply.payload.error);
-            break;
+        if (chunk.type == TRANSFER_ERROR) {
+            snprintf(error, error_size, "%.255s", chunk.payload.error);
+            return;
         }
-        if (reply.type != TRANSFER_DATA ||
-            reply.payload.chunk.length > TRANSFER_CHUNK) {
-            failed = 1;
-            snprintf(error, sizeof(error), "invalid transfer data");
-            break;
+        if (chunk.type != TRANSFER_DATA ||
+            chunk.payload.chunk.length > TRANSFER_CHUNK) {
+            snprintf(error, error_size, "invalid transfer data");
+            return;
         }
-        if (!failed &&
-            write_all(target_fd, reply.payload.chunk.data,
-                      reply.payload.chunk.length) < 0) {
-            failed = 1;
-            snprintf(error, sizeof(error), "cannot write transfer destination");
+        /* After a write error keep draining, so that the sender is not blocked. */
+        if (error[0] == '\0' &&
+            write_all(target_fd, chunk.payload.chunk.data,
+                      chunk.payload.chunk.length) < 0) {
+            snprintf(error, error_size, "cannot write transfer destination");
         }
     }
-    if (fs_transfer_finish(target_fd, target_path, !failed,
-                           error, sizeof(error)) < 0) {
-        failed = 1;
+}
+
+static int receive_accepted_file(int client_fd, const fs_session *session,
+                                 const transfer_request_message *request,
+                                 const char *directory)
+{
+    transfer_reply_message reply = {0};
+    char target_path[PATH_MAX];
+    char error[512] = "";
+    mqd_t sender_queue = (mqd_t)-1;
+    mqd_t data_queue = (mqd_t)-1;
+    int target_fd = -1;
+
+    if (valid_pending_request(request)) {
+        sender_queue = mq_open(request->reply_queue, O_WRONLY);
+        data_queue = mq_open(request->data_queue, O_RDONLY);
     }
-    reply = (transfer_reply_message){0};
-    reply.type = TRANSFER_RESULT;
-    if (failed) {
+    if (sender_queue == (mqd_t)-1 || data_queue == (mqd_t)-1) {
+        snprintf(error, sizeof(error), "sender is no longer online");
+    } else if (fs_transfer_target(session, directory, request->filename,
+                                  &target_fd, target_path, sizeof(target_path),
+                                  error, sizeof(error)) < 0) {
+        reply.type = TRANSFER_ERROR;
         snprintf(reply.payload.error, sizeof(reply.payload.error), "%.255s", error);
+        mq_send(sender_queue, (const char *)&reply, sizeof(reply), 0);
+    } else {
+        reply.type = TRANSFER_ACCEPT;
+        if (mq_send(sender_queue, (const char *)&reply, sizeof(reply), 0) < 0) {
+            snprintf(error, sizeof(error), "cannot notify transfer sender");
+        } else {
+            receive_chunks(data_queue, request->sender_pid, target_fd,
+                           error, sizeof(error));
+        }
+        fs_transfer_finish(target_fd, target_path, error[0] == '\0',
+                           error, sizeof(error));
+        reply = (transfer_reply_message){0};
+        reply.type = TRANSFER_RESULT;
+        snprintf(reply.payload.error, sizeof(reply.payload.error), "%.255s", error);
+        mq_send(sender_queue, (const char *)&reply, sizeof(reply), 0);
     }
-    if (mq_send(sender_queue, (const char *)&reply, sizeof(reply), 0) < 0 &&
-        !failed) {
-        failed = 1;
-        snprintf(error, sizeof(error), "cannot return transfer result to sender");
+    if (sender_queue != (mqd_t)-1) {
+        mq_close(sender_queue);
     }
-    mq_close(sender_queue);
-    mq_close(data_queue);
-    if (failed) {
+    if (data_queue != (mqd_t)-1) {
+        mq_close(data_queue);
+    }
+    if (error[0] != '\0') {
         return send_error(client_fd, error);
     }
     return send_text(client_fd, "OK: transfer accepted and file copied\n");
