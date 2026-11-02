@@ -565,11 +565,18 @@ int fs_write(const fs_session *session, const char *path, off_t offset,
     if (descriptor < 0) {
         return fail(error, error_size, "cannot open file for writing");
     }
-    if (flock(descriptor, LOCK_EX) < 0 ||
-        (replace && ftruncate(descriptor, 0) < 0) ||
+    if (flock(descriptor, LOCK_EX | LOCK_NB) < 0) {
+        if (errno == EWOULDBLOCK || errno == EAGAIN) {
+            close(descriptor);
+            return fail_plain(error, error_size,
+                              "file is busy with another operation");
+        }
+        return fail(error, error_size, "cannot lock file for writing");
+    }
+    if ((replace && ftruncate(descriptor, 0) < 0) ||
         lseek(descriptor, replace ? 0 : offset, SEEK_SET) < 0) {
         return fail_close(descriptor, error, error_size,
-                          "cannot lock or seek file for writing");
+                          "cannot prepare file for writing");
     }
     if (write_all(descriptor, data, data_length) < 0) {
         return fail_close(descriptor, error, error_size, "cannot write file");

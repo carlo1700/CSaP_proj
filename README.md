@@ -93,8 +93,9 @@ users share the group `users`; "other" bits are never needed).
   `waitpid`, so no zombies are left.
 - `read`, `download` and the sender side of transfers take a shared `flock`;
   `write`, `upload`, `delete`, `move`, `chmod` and the copy target take an
-  exclusive one. So readers run in parallel, writers wait for each other and
-  for readers, and delete counts as a write. `move` locks both paths in a
+  exclusive one. A `write` that finds the file locked fails immediately with a
+  busy error; the other operations wait for incompatible locks. Readers can
+  run in parallel, and delete counts as a write. `move` locks both paths in a
   fixed order, so it cannot deadlock.
 - `transfer_request` uses POSIX message queues: one notification queue per
   user (`/csap_user_<uid>`), plus per-request reply and data queues. Data is
