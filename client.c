@@ -9,57 +9,173 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <termios.h>
 #include <unistd.h>
 
 #define DEFAULT_IP "127.0.0.1"
 #define DEFAULT_PORT "8080"
 
-/* Reads lines from stdin until a line containing only ".". */
+static int append_write_input(unsigned char **contents, size_t *length,
+                              size_t *capacity, const unsigned char *data,
+                              size_t data_length)
+{
+    size_t needed;
+
+    if (data_length > NETWORK_MAX_FRAME - *length) {
+        errno = EMSGSIZE;
+        return -1;
+    }
+    needed = *length + data_length;
+    if (needed > *capacity) {
+        size_t new_capacity = *capacity == 0 ? 1024 : *capacity;
+        unsigned char *new_contents;
+
+        while (new_capacity < needed) {
+            if (new_capacity > NETWORK_MAX_FRAME / 2) {
+                new_capacity = NETWORK_MAX_FRAME;
+                break;
+            }
+            new_capacity *= 2;
+        }
+        new_contents = realloc(*contents, new_capacity);
+        if (new_contents == NULL) {
+            return -1;
+        }
+        *contents = new_contents;
+        *capacity = new_capacity;
+    }
+    memcpy(*contents + *length, data, data_length);
+    *length = needed;
+    return 0;
+}
+
+static int collect_terminal_input(unsigned char **contents, size_t *length,
+                                  size_t *capacity)
+{
+    struct termios original;
+    struct termios input_mode;
+    unsigned char character;
+    int result = -1;
+    int saved_errno = 0;
+
+    if (tcgetattr(STDIN_FILENO, &original) < 0) {
+        print_error("cannot read terminal settings");
+        return -1;
+    }
+    input_mode = original;
+    input_mode.c_lflag &= (tcflag_t)~(ICANON | ECHO | ISIG);
+    input_mode.c_cc[VMIN] = 1;
+    input_mode.c_cc[VTIME] = 0;
+    if (tcsetattr(STDIN_FILENO, TCSANOW, &input_mode) < 0) {
+        print_error("cannot configure terminal");
+        return -1;
+    }
+
+    for (;;) {
+        ssize_t count = read(STDIN_FILENO, &character, sizeof(character));
+
+        if (count < 0 && errno == EINTR) {
+            continue;
+        }
+        if (count < 0) {
+            saved_errno = errno;
+            print_error("cannot read terminal input");
+            break;
+        }
+        if (count == 0 || character == '\004') {
+            result = 0;
+            break;
+        }
+        if (character == '\003') {
+            printf("\nERROR: write cancelled; disconnecting\n");
+            break;
+        }
+        if (character == '\b' || character == '\177') {
+            if (*length > 0) {
+                --*length;
+                while (*length > 0 &&
+                       ((*contents)[*length] & 0xc0) == 0x80) {
+                    --*length;
+                }
+                if (write_all(STDOUT_FILENO, "\b \b", 3) < 0) {
+                    saved_errno = errno;
+                    print_error("cannot update terminal");
+                    break;
+                }
+            }
+            continue;
+        }
+        if (character == '\r' || character == '\n') {
+            character = '\n';
+        }
+        if (append_write_input(contents, length, capacity, &character, 1) < 0) {
+            saved_errno = errno;
+            print_error(saved_errno == EMSGSIZE
+                            ? "input exceeds the maximum frame size"
+                            : "cannot collect file content");
+            break;
+        }
+        if (write_all(STDOUT_FILENO, &character, 1) < 0) {
+            saved_errno = errno;
+            print_error("cannot update terminal");
+            break;
+        }
+    }
+
+    if (tcsetattr(STDIN_FILENO, TCSANOW, &original) < 0) {
+        print_error("cannot restore terminal settings");
+        result = -1;
+    }
+    if (result == 0 && write_all(STDOUT_FILENO, "\n", 1) < 0) {
+        print_error("cannot update terminal");
+        result = -1;
+    }
+    if (saved_errno != 0) {
+        errno = saved_errno;
+    }
+    return result;
+}
+
+/* Collects content until Ctrl+D in a terminal or EOF in redirected input. */
 static int collect_write_input(unsigned char **contents, size_t *length)
 {
     char *line = NULL;
     size_t line_capacity = 0;
     size_t capacity = 0;
     ssize_t line_length;
+    int result = -1;
 
     *contents = NULL;
     *length = 0;
-    printf("Enter file content; type a single '.' on a line to finish.\n");
-    while ((line_length = getline(&line, &line_capacity, stdin)) >= 0) {
-        if ((line_length == 2 && line[0] == '.' && line[1] == '\n') ||
-            (line_length == 1 && line[0] == '.')) {
-            free(line);
-            return 0;
-        }
-        if (*length + (size_t)line_length > NETWORK_MAX_FRAME) {
-            printf("ERROR: input exceeds the %u-byte limit\n", NETWORK_MAX_FRAME);
-            break;
-        }
-        if (*length + (size_t)line_length > capacity) {
-            size_t new_capacity = capacity == 0 ? 1024 : capacity;
-            unsigned char *new_contents;
-
-            while (new_capacity < *length + (size_t)line_length) {
-                new_capacity *= 2;
+    printf("Enter file content; press Ctrl+D to finish.\n");
+    if (isatty(STDIN_FILENO)) {
+        result = collect_terminal_input(contents, length, &capacity);
+    } else {
+        while ((line_length = getline(&line, &line_capacity, stdin)) >= 0) {
+            if (append_write_input(contents, length, &capacity,
+                                   (unsigned char *)line,
+                                   (size_t)line_length) < 0) {
+                print_error(errno == EMSGSIZE
+                                ? "input exceeds the maximum frame size"
+                                : "cannot collect file content");
+                goto done;
             }
-            new_contents = realloc(*contents, new_capacity);
-            if (new_contents == NULL) {
-                break;
-            }
-            *contents = new_contents;
-            capacity = new_capacity;
         }
-        memcpy(*contents + *length, line, (size_t)line_length);
-        *length += (size_t)line_length;
+        if (feof(stdin)) {
+            result = 0;
+        } else {
+            print_error("cannot read file content");
+        }
     }
+
+done:
     free(line);
-    if (line_length < 0 && feof(stdin)) {
-        return 0;
+    if (result < 0) {
+        free(*contents);
+        *contents = NULL;
+        *length = 0;
     }
-    free(*contents);
-    *contents = NULL;
-    *length = 0;
-    return -1;
+    return result;
 }
 
 /* Recognizes "<name> <path>" and "<name> -offset=<num> <path>". */

@@ -64,7 +64,7 @@ Every command prints `OK: ...` or `ERROR: <reason>`.
 | `pwd` | current directory, e.g. `/docs` (`/` is the home) |
 | `list [path]` | one line per entry: `rw-r-----	notes.txt	12 bytes` |
 | `read [-offset=<n>] <path>` | file content from byte `n` printed on stdout |
-| `write [-offset=<n>] <path>` | type the content, end with a line containing only `.`; `OK: file written`. Without `-offset` the file is replaced, with it the data is written from byte `n`. New files get permissions 0700 |
+| `write [-offset=<n>] <path>` | type the content and press Ctrl+D directly to finish; backspace edits the input. With redirected stdin, input ends at EOF. The command prints `OK: file written` on success. Without `-offset` the file is replaced, with it the data is written from byte `n`. New files get permissions 0700 |
 | `delete <path>` | `OK: deleted` (files and empty directories) |
 | `upload [-b] <client path> <server path>` | `OK: upload complete`; with `-b`: `Started background upload (pid N)` and later `[Background] Command: upload <server path> <client path> concluded` |
 | `download [-b] <server path> <client path>` | `OK: download complete`; with `-b`: `[Background] Command: download <server path> <client path> concluded` |
