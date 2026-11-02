@@ -114,6 +114,83 @@ static int find_home(const char *root, const char *username, char *path,
     return 0;
 }
 
+static int empty_directory_contents(int directory_fd)
+{
+    int duplicate_fd = dup(directory_fd);
+    DIR *directory;
+    struct dirent *entry;
+    int result = 0;
+    int saved_errno = 0;
+
+    if (duplicate_fd < 0) {
+        return -1;
+    }
+    directory = fdopendir(duplicate_fd);
+    if (directory == NULL) {
+        saved_errno = errno;
+        close(duplicate_fd);
+        errno = saved_errno;
+        return -1;
+    }
+    for (;;) {
+        struct stat status;
+        int child_fd;
+
+        errno = 0;
+        entry = readdir(directory);
+        if (entry == NULL) {
+            if (errno != 0) {
+                result = -1;
+                saved_errno = errno;
+            }
+            break;
+        }
+        if (strcmp(entry->d_name, ".") == 0 ||
+            strcmp(entry->d_name, "..") == 0) {
+            continue;
+        }
+        if (fstatat(directory_fd, entry->d_name, &status,
+                    AT_SYMLINK_NOFOLLOW) < 0) {
+            result = -1;
+            saved_errno = errno;
+            break;
+        }
+        if (S_ISDIR(status.st_mode)) {
+            child_fd = openat(directory_fd, entry->d_name,
+                              O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+            if (child_fd < 0) {
+                result = -1;
+                saved_errno = errno;
+                break;
+            }
+            if (empty_directory_contents(child_fd) < 0) {
+                result = -1;
+                saved_errno = errno;
+                close(child_fd);
+                break;
+            }
+            close(child_fd);
+            if (unlinkat(directory_fd, entry->d_name, AT_REMOVEDIR) < 0) {
+                result = -1;
+                saved_errno = errno;
+                break;
+            }
+        } else if (unlinkat(directory_fd, entry->d_name, 0) < 0) {
+            result = -1;
+            saved_errno = errno;
+            break;
+        }
+    }
+    if (closedir(directory) < 0 && result == 0) {
+        result = -1;
+        saved_errno = errno;
+    }
+    if (result < 0) {
+        errno = saved_errno;
+    }
+    return result;
+}
+
 int fs_initialize_root(const char *root_path, char *error, size_t error_size)
 {
     char canonical_root[PATH_MAX];
@@ -166,12 +243,16 @@ int fs_create_user(const char *root, const char *username, mode_t permissions,
                    char *error, size_t error_size)
 {
     char user_path[PATH_MAX];
-    struct stat status;
+    char users_path[PATH_MAX];
     struct group *shared_group;
     struct passwd *user;
     gid_t users_gid;
     pid_t child;
     int child_status;
+    int root_fd = -1;
+    int users_fd = -1;
+    int home_fd = -1;
+    int result = -1;
 
     if (!valid_username(username)) {
         return fail_plain(error, error_size, "invalid username");
@@ -186,47 +267,90 @@ int fs_create_user(const char *root, const char *username, mode_t permissions,
                           "required shared system group 'users' is missing");
     }
     users_gid = shared_group->gr_gid;
-    if (getpwnam(username) != NULL) {
-        return fail_plain(error, error_size,
-                          "a system user with that username already exists");
+    if (snprintf(users_path, sizeof(users_path), "%s/users", root) >=
+        (int)sizeof(users_path) ||
+        snprintf(user_path, sizeof(user_path), "%s/%s", users_path,
+                 username) >= (int)sizeof(user_path)) {
+        return fail_with(error, error_size, ENAMETOOLONG,
+                         "user home path is too long");
     }
-    if (find_home(root, username, user_path, sizeof(user_path), &status) == 0) {
-        return fail_plain(error, error_size,
-                          "a home directory with that username already exists");
+    root_fd = open(root, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    if (root_fd < 0) {
+        return fail(error, error_size, "cannot open server root");
     }
-    if (errno != ENOENT) {
-        return fail(error, error_size, "cannot check user home path");
-    }
-
-    child = fork();
-    if (child < 0) {
-        return fail(error, error_size, "cannot start adduser");
-    }
-    if (child == 0) {
-        execlp("adduser", "adduser", "--disabled-password", "--gecos", "",
-               "--ingroup", "users", username, (char *)NULL);
-        _exit(127);
-    }
-    while (waitpid(child, &child_status, 0) < 0) {
-        if (errno != EINTR) {
-            return fail(error, error_size, "cannot wait for adduser");
-        }
-    }
-    if (!WIFEXITED(child_status) || WEXITSTATUS(child_status) != 0) {
-        return fail_plain(error, error_size, "adduser failed to create system account");
+    users_fd = openat(root_fd, "users",
+                      O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    close(root_fd);
+    root_fd = -1;
+    if (users_fd < 0) {
+        return fail(error, error_size, "cannot open users directory");
     }
     user = getpwnam(username);
+    if (user == NULL) {
+        child = fork();
+        if (child < 0) {
+            fail(error, error_size, "cannot start adduser");
+            goto done;
+        }
+        if (child == 0) {
+            execlp("adduser", "adduser", "--disabled-password", "--gecos", "",
+                   "--ingroup", "users", username, (char *)NULL);
+            _exit(127);
+        }
+        while (waitpid(child, &child_status, 0) < 0) {
+            if (errno != EINTR) {
+                fail(error, error_size, "cannot wait for adduser");
+                goto done;
+            }
+        }
+        if (!WIFEXITED(child_status) || WEXITSTATUS(child_status) != 0) {
+            fail_plain(error, error_size,
+                       "adduser failed to create system account");
+            goto done;
+        }
+        user = getpwnam(username);
+    }
     if (user == NULL || user->pw_gid != users_gid) {
-        return fail_plain(error, error_size,
-                          "created account is not in the shared users group");
+        fail_plain(error, error_size,
+                   "user account must have the shared group 'users'");
+        goto done;
     }
-    /* chmod after mkdir, because mkdir applies the umask. */
-    if (mkdir(user_path, permissions) < 0 ||
-        chown(user_path, user->pw_uid, users_gid) < 0 ||
-        chmod(user_path, permissions) < 0) {
-        return fail(error, error_size, "cannot create user home");
+    home_fd = openat(users_fd, username,
+                     O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    if (home_fd < 0 && errno == ENOENT) {
+        if (mkdirat(users_fd, username, permissions) < 0) {
+            fail(error, error_size, "cannot create user home");
+            goto done;
+        }
+        home_fd = openat(users_fd, username,
+                         O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
     }
-    return 0;
+    if (home_fd < 0) {
+        fail(error, error_size, "cannot open existing user home");
+        goto done;
+    }
+    if (empty_directory_contents(home_fd) < 0) {
+        fail(error, error_size, "cannot empty existing user home");
+        goto done;
+    }
+    if (fchown(home_fd, user->pw_uid, users_gid) < 0 ||
+        fchmod(home_fd, permissions) < 0) {
+        fail(error, error_size, "cannot configure user home");
+        goto done;
+    }
+    result = 0;
+
+done:
+    if (home_fd >= 0) {
+        if (close(home_fd) < 0 && result == 0) {
+            fail(error, error_size, "cannot close user home");
+            result = -1;
+        }
+    }
+    if (users_fd >= 0) {
+        close(users_fd);
+    }
+    return result;
 }
 
 int fs_login(fs_session *session, const char *root, const char *username,

@@ -113,7 +113,7 @@ static int command_create_user(int client_fd, client_state *state,
     result = fs_create_user(state->root, arguments[1], permissions,
                             error, sizeof(error));
     privilege_lower();
-    return reply(client_fd, result, error, "OK: user created\n");
+    return reply(client_fd, result, error, "OK: user ready; home initialized\n");
 }
 
 static int command_create(int client_fd, client_state *state,

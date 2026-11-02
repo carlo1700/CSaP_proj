@@ -55,7 +55,7 @@ Every command prints `OK: ...` or `ERROR: <reason>`.
 
 | Command | Expected output |
 |---------|-----------------|
-| `create_user <username> <perm>` e.g. `create_user alice 750` | `OK: user created` – creates the system account (no password, group `users`) and the home with the given octal permissions |
+| `create_user <username> <perm>` e.g. `create_user alice 750` | `OK: user ready; home initialized` – creates the system account if missing (group `users`) and creates or resets its home with the given octal permissions. **If the home already exists, all its contents are deleted.** |
 | `login <username>` | `OK: logged in` (`ERROR: user does not exist` otherwise) |
 | `create <path> <perm>` / `create -d <path> <perm>` | `OK: created` – empty file / directory |
 | `chmod <path> <perm>` | `OK: permissions changed` |
